@@ -1,5 +1,6 @@
 import os
 import json
+from itertools import compress
 import numpy as np
 import matplotlib.pyplot as plt
 import h5py
@@ -43,42 +44,14 @@ class Urchin:
             Returns
             -------
             list
-                2D list with [stimuli_name, index_of_start, index_of_stop] entries.
+                2D list with [stimuli_name, index_of_start, index_of_stop, [timing_info]] entries.
                 index start and stop is inclusive (since pulses examined are only HIGH (on_times))
         """
+        # TODO: bring back _find_pauses and _find_non_pause_bounds and bring out _separate_stims and _find_stim_bounds
         intervals = [(ind, interval) for ind, interval in enumerate(np.diff(self.on_times)) if interval >=25]
 
-        # Several inner functions to help separate:
-        #   (_find_pauses,_find_non_pause_bounds,_split_pause_chunks)
-        def _separate_stims(start_bound, stop_bound, _duration):
-            # Separate combination of stims into individuals.
-            # stop_bound will be upcoming pause, which will stay the same, but
-            # start_bound MUST be shifted to end index of previous stimulus.
-            time_to_find = self.on_times[start_bound]+ _duration
-            times_to_search = self.on_times[start_bound:stop_bound+1]
-            # The space between TTL pulses (~half the frame rate) is 0.0834.
-            # rtol is 0.003, or 3.58% of the pulse spacing.
-            found_time = np.isclose(times_to_search, time_to_find, rtol=0.003, atol=0.01)
-            ind_found_time = np.where(found_time == True)[0]
-            return start_bound + ind_found_time[0] if ind_found_time.size != 0 else None
-
-        def _find_stim_bounds(start_bound, stop_bound, bound_stims):
-            # Find bounds of each stimulus, Pause or non-pause.
-            # Use non_pause_bounds to search for complete or additive combination of stims.
-            # Use _separate_stims to find stim start and stop, regardless
-            # of individual or combination of stim(s) in non-pause bound.
-            stim_ends = []
-            for ind, (name, sus_stim) in enumerate(bound_stims):
-                if name == 'Pause':
-                    # Since non_pause_bounds does not include pause indices (beginning), adjust so pause can be found too.
-                    # This is for the sake of accurate start_bound shifting.
-                    stim_ends.append([name, start_bound-2, _separate_stims(start_bound-2, stop_bound, sus_stim)])
-                else:
-                    stim_ends.append([name, start_bound, _separate_stims(start_bound, stop_bound, sus_stim)])
-
-                start_bound += stim_ends[ind][2]-start_bound if stim_ends[ind][2] is not None else 0
-
-            return stim_ends
+        # Several helper functions to help separate:
+        #   (_find_pauses, _find_non_pause_bounds, _split_pause_chunks, _separate_stims, _find_stim_bounds)
 
         remove_nones = lambda a_l: [a for a in a_l if a is not None]
         peel_nesting = lambda a_l: [a_s for a in a_l for a_s in a]
@@ -87,13 +60,72 @@ class Urchin:
         pause_bounds = remove_nones([self._find_pauses(ind,interval,self.stim_sum[:2]) for ind, interval in intervals])
         non_pause_bounds = peel_nesting([self._find_non_pause_bounds(ind, bound, pause_bounds) for ind, bound in enumerate(pause_bounds)])
         chunks = self._split_pause_chunks(self.stim_sum)
-        stim_test = peel_nesting([_find_stim_bounds(*bound, stim) for bound, stim in zip(non_pause_bounds, chunks)])
+        stim_test = peel_nesting([self._find_stim_bounds(*bound, stim) for bound, stim in zip(non_pause_bounds, chunks)])
 
         return stim_test
 
+    def find_stim(stim_name):
+        """ Get JSON config for particular stim given name."""
+        for stim in stim_list:
+            if (stim['protocolName'] == stim_name):
+                return stim
+
+    def split_into_sub_stimuli(name, start_bound, stop_bound, timing_info):
+        """ For most stimuli, the actual stimulus is repeated in each epoch; sub-stimulus bounds must be extracted.
+            To determine how many bounds to make (epoch_num), and the time of each bound (epoch_time).
+
+            Parameters
+            ----------
+            timing_info: list
+                        [epoch_num, epoch_time, interval_time]
+
+            Returns
+            -------
+            dict
+                Nested, with keys for each repetition ('rep_{i}').
+                Within each rep_i is a dict with keys ({stim_option in stim_options} or 'epoch').
+        """
+        epoch_num, epoch_time, interval_time = timing_info
+        # To get label for each epoch by change to stimulus (i.e. orientation, intensity)
+        valid_option = lambda opt, st: list(compress(opt, [op in st for op in opt]))
+        def chunk(ar, n):
+            for i in range(0, len(ar), n):
+                yield ar[i:i+n]
+
+        stim_options = ['stepSizes', 'orientations', 'gratingOrientations']
+        stim_log = ['flashLog', 'orientationLog']
+        current_stim = self.find_stim(name)
+        stim_options = current_stim[valid_option(stim_options,current_stim)[0]] if valid_option(stim_options,current_stim) else 1
+        stim_log = current_stim[valid_option(stim_log,current_stim)[0]] if valid_option(stim_log,current_stim) else 1
+        stim_log = list(chunk(stim_log, len(stim_options))) if stim_options !=1 else None
+        rep_num = epoch_num // len(stim_options) if stim_options != 1 else epoch_num
+
+        sub_rep_ends, sub_epoch_ends = [], []
+        for _ in range(rep_num):
+            sub_epoch_ends = []
+            for option in range( (len(stim_options) if isinstance(stim_options,list) else stim_options) ):
+                sub_epoch_ends.append([start_bound, self._separate_stims(start_bound,stop_bound, epoch_time)])
+                start_bound += sub_epoch_ends[option][1]-start_bound if sub_epoch_ends[option][1] is not None else 0
+                if interval_time != 0:
+                    sub_epoch_ends.append([start_bound, self._separate_stims(start_bound,stop_bound, interval_time)])
+                    start_bound += sub_epoch_ends[option][1]-start_bound if sub_epoch_ends[option][1] is not None else 0
+            sub_rep_ends.append(sub_epoch_ends)
+
+        sub_ends = {f'rep_{ind_r}':{f'{opt_label}':e_bounds for opt_label, e_bounds in zip(
+                                     ( stim_log[ind_r] if stim_options != 1 else ['epoch']*stim_options ),
+                                     epochs_bounds)}
+                       for ind_r, epochs_bounds in enumerate(sub_rep_ends)}
+
+        return sub_ends
 
     def extract_spiketimes(self,group_idx,cluster_id):
-        """ Extract spike times from given group_idx (group directory) and cluster_id."""
+        """ Extract spike times from given group_idx (group directory) and cluster_id.
+
+            Returns
+            -------
+            numpy.ndarray
+                        1D Array with spike_times (in seconds) for a given cluster_id
+        """
 
         # 'grp_spiketimes' is a list of every spike time in the group
         # 'grp_spikeclusters' is a list mapping cluster_id to the times in 'grp_spiketimes'
@@ -101,19 +133,40 @@ class Urchin:
         grp_spikeclusters = np.load(f'{self.path_to_sorted_data}/{group_idx}/traces/traces.GUI/spike_clusters.npy')
 
         grp_spikeinfo = np.vstack((grp_spiketimes,grp_spikeclusters)).T
-        # To extract spike_times of a given cluster_id, the above lists need to be sorted by 'grp_spikeclusters'
+        # To extract spike_times of a given cluster_id, the above array need to be sorted by 'grp_spikeclusters'
         # and then extracted for element matching cluster_id.
         # Sorting is not neccessary, but will it boost speed?
         grp_spikeinfo = grp_spikeinfo[grp_spikeinfo[:,1].argsort()]
+        # Divide by 20000, as this is refresh rate of MEA, and times are in (seconds from start)*refresh rate.
+        return grp_spikeinfo[grp_spikeinfo[:,1] == int(cluster_id), 0] / 20000
 
-        return grp_spikeinfo[grp_spikeinfo[:,1]==int(cluster_id),0]
+    def spiketimes_within_bounds(self, spike_times, bounds):
+        """ Extract spike times that occur between bound in bounds.
+
+            Parameters
+            ----------
+            bounds: dict
+                        Provided from split_into_stimuli, can be either one repetition, or
+                        one bound range (i.e. [start_bound, stop_bound]).
+            Returns
+            -------
+            dict or ndarray
+                            The spike times within specified bound(s). Matches parameter order.
+        """
+        mask = lambda a_l, st, stp: np.logical_and(a_l >= self.on_times[st], a_l <= self.on_time[stp])
+        # Mask finds times within bounds.
+        if isinstance(bounds, dict):
+            return {option:spike_times[mask(spike_times, bound[0], bound[1])] for option, bound in bounds.items()}
+        else:
+            start_bound, stop_bound = bounds
+            return spike_times[mask(spike_times, start_bound, stop_bound)]
 
     def generate_RF(self):
         """ Generate receptive field for given spike times of cluster_id."""
 
     def _extract_clusters(self):
         """ Go through given data directory and assemble list of cluster_id's
-            as a 2x2 matrix with row index as group_idx-1 and elements in row as
+            as a 2x2 matrix with row index as group_idx-1, and each row element as
             'good' labelled cluster_id's for group_idx.
         """
 
@@ -190,6 +243,36 @@ class Urchin:
                     pause_chunks.append(stim_sum[cut:len(stim_sum)])
 
             return pause_chunks
+
+    def _separate_stims(self, start_bound, stop_bound, _duration):
+        # Separate combination of stims into individuals.
+        # stop_bound will be upcoming pause, which will stay the same, but
+        # start_bound MUST be shifted to end index of previous stimulus.
+        time_to_find = self.on_times[start_bound]+ _duration
+        times_to_search = self.on_times[start_bound:stop_bound+1]
+        # The space between TTL pulses (~half the frame rate) is 0.0834.
+        # rtol is 0.003, or 3.58% of the pulse spacing.
+        found_time = np.isclose(times_to_search, time_to_find, rtol=0.003, atol=0.01)
+        ind_found_time = np.where(found_time == True)[0]
+        return start_bound + ind_found_time[0] if ind_found_time.size != 0 else None
+
+    def _find_stim_bounds(self, start_bound, stop_bound, bound_stims):
+        # Find bounds of each stimulus, Pause or non-pause.
+        # Use non_pause_bounds to search for complete or additive combination of stims.
+        # Use _separate_stims to find stim start and stop, regardless
+        # of individual or combination of stim(s) in non-pause bound.
+        stim_ends = []
+        for ind, (name, sus_stim) in enumerate(bound_stims):
+            if name == 'Pause':
+                # Since non_pause_bounds does not include pause indices (beginning), adjust so pause can be found too.
+                # This is for the sake of accurate start_bound shifting.
+                stim_ends.append([name, start_bound-2, self._separate_stims(start_bound-2, stop_bound, sus_stim)])
+            else:
+                stim_ends.append([name, start_bound, self._separate_stims(start_bound, stop_bound, sus_stim)])
+
+            start_bound += stim_ends[ind][2]-start_bound if stim_ends[ind][2] is not None else 0
+
+        return stim_ends
 
     def _extract_stim_times(self):
         """ Used to separate stimulus timing lengths from JSON config."""

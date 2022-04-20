@@ -166,14 +166,23 @@ def _find_sub_stim_bounds(name, start_bound, stop_bound, timing_info):
 
         sub_rep_ends.append(sub_epoch_ends)
 
-    sub_ends = {f'rep_{ind_r}':{f'id_{ind_e}_epoch_{opt_label}':e_bounds for ind_e, opt_label, e_bounds in zip(
-                                 ( range(len(stim_options)) if stim_options != 1 else range(stim_options) ),
-                                 ( stim_log[ind_r] if stim_options != 1 else ['n']*stim_options ),
+    sub_ends = {f'rep_{ind_r}':{f'{opt_label}':e_bounds for opt_label, e_bounds in zip(
+                                 ( stim_log[ind_r] if stim_options != 1 else ['epoch']*stim_options ),
                                  epochs_bounds)}
                    for ind_r, epochs_bounds in enumerate(sub_rep_ends)}
 
     # sub_stim_ends = {f'epoch_{ind}':epoch_bounds for ind, epoch_bounds in zip(range(epoch_num), sub_stim_ends)}
     return sub_ends
+
+def spiketimes_within_bounds(spike_times, bounds):
+    """ Extract spike times that occur between bound in bounds."""
+    mask = lambda a_l, st, stp: np.logical_and(a_l >= prune_times[st], a_l <= prune_times[stp])
+    if isinstance(bounds, dict):
+        return {option:spike_times[mask(spike_times, bound[0], bound[1])] for option, bound in bounds.items()}
+    else:
+        start_bound, stop_bound = bounds
+        return spike_times[mask(spike_times, start_bound, stop_bound)]
+
 
 peel_nesting = lambda a_l: [a_s for a in a_l for a_s in a]
 pause_bounds = [_find_pauses(ind,interval,stim_sum) for ind, interval in intervals if _find_pauses(ind,interval,stim_sum) != None]
@@ -181,12 +190,21 @@ non_pause_bounds = [_find_non_pause_bounds(ind, bound) for ind, bound in enumera
 non_pause_bounds = [non_pause for non_pause_bound in non_pause_bounds for non_pause in non_pause_bound]
 chunks = _split_pause_chunks()
 stim_bounds = peel_nesting([_find_stim_bounds(*bound, stim) for bound, stim in zip(non_pause_bounds, chunks)])
-print(stim_bounds[3])
+print(stim_bounds[4])
 sub_stim_bounds = _find_sub_stim_bounds(*stim_bounds[3])
 print(sub_stim_bounds['rep_0'])
 # The spikes occurring within bound of stimuli time can now be extracted per cluster.
 print(f'epoch: {(prune_times[48]-prune_times[46]) - stim_bounds[3][3][1]}')
 
+epoch_t = spiketimes_within_bounds(cl_spiketimes,sub_stim_bounds['rep_0'])
+
+# load example spike_times for cluster 10
+normalize = lambda a_l: (a_l - min(a_l)) / (max(a_l) - min(a_l))
+cl_spiketimes = np.load("ss/analysis/data/cluster_10.npy") / 20000
+cl_epoch = cl_spiketimes[np.logical_and(cl_spiketimes >= prune_times[120], cl_spiketimes <= prune_times[127])]
+cl_epoch_n = normalize(cl_epoch)
+counts, bins = np.histogram(cl_epoch, bins='auto')
+plt.hist(cl_epoch_n, bins=9)
 # ---------------------
 #   Testing components
 # ---------------------
