@@ -3,6 +3,7 @@ import json
 import math
 from itertools import compress
 import matplotlib.pyplot as plt
+import seaborn as sns; sns.set_theme()
 
 %matplotlib inline
 %config InlineBackend.figure_format = 'svg'
@@ -176,12 +177,59 @@ def _find_sub_stim_bounds(name, start_bound, stop_bound, timing_info):
 
 def spiketimes_within_bounds(spike_times, bounds):
     """ Extract spike times that occur between bound in bounds."""
+    # Mask finds times within bounds.
     mask = lambda a_l, st, stp: np.logical_and(a_l >= prune_times[st], a_l <= prune_times[stp])
-    if isinstance(bounds, dict):
+    # Grouper extracts spike_times for clusters in 'cluster_id' (assumes stye of self.extracted_clusters)
+    def _grouper(c_idxs):
+        for g_id, c_ids in enumerate(c_idxs):
+            if c_ids != 0:
+                for c_id in c_ids:
+                    # g_id + 1 as g_id is zero indexed, but group folders are 1 indexed.
+                    yield _extract_spiketimes(g_id+1, c_id)
+
+    if isinstance(bounds, dict) and isinstance(cluster_id, int):
+        # Multiple sub-stimuli bounds are provided, and spike_times holds one cluster.
+        assert group_idx is not None
+        spike_times = _extract_spiketimes(group_idx, cluster_id)
         return {option:spike_times[mask(spike_times, bound[0], bound[1])] for option, bound in bounds.items()}
-    else:
+    elif isinstance(bounds, dict) and isinstance(cluster_id, list):
+        # Multiple sub-stimuli bounds are provided, but spike_times holds multiple clusters.
+        return {option:[s_t[mask(s_t, bound[0], bound[1])] for s_t in list(_grouper(cluster_id))] for option, bound in bounds.items()}
+    elif isinstance(cluster_id, list):
+        # Single bounds is provided, but spike_times holds multiple clusters.
+        asssert group_idx is not None
         start_bound, stop_bound = bounds
+        spike_times = _extract_spiketimes(group_idx, cluster_id)
+        return [spike_times[mask(spike_times, start_bound, stop_bound)] for spike_time in spike_times]
+    else:
+        # Single bounds and single cluster.
+        assert group_idx is not None
+        start_bound, stop_bound = bounds
+        spike_times = _extract_spiketimes(group_idx, cluster_id)
         return spike_times[mask(spike_times, start_bound, stop_bound)]
+
+def create_PSTH(bounded_spike_times, window_size=50, step=10):
+    start_time, stop_time = bounded_spike_times[0], bounded_spike_times[-1:]
+
+    mask = lambda a_l, st, stp, at_end=False: np.logical_and(a_l >= st, a_l < stp) if not at_end else np.logical_and(a_l >= st, a_l <= stp)
+    # chunk to return generator with premade windows to look at bounded_spike_times through.
+    def chunk(strt_b, stp_b, win_s, s):
+        # Won't work cleanly when (stp_b - win_s) mod(s) != 0
+        # Get n number of intervals to divide up time, before edge of window goes out of bounds.
+        n = int(((stp_b - win_s) - strt_b) // s)
+        cn = strt_b
+        for i in range(n+1):
+            b_b = cn, cn+win_s
+            cn += s
+            # Make last bin equal to end of previous bin till stp_b.
+            yield b_b if i != n else (cn, stp_b)
+
+    windows = list(chunk(start_time, stop_time, window_size*10**-3, step*10**-3))
+
+    counts = [np.count_nonzero(mask(bounded_spike_times, start_t, stop_t) == True) if ind != len(windows)-1
+        else np.count_nonzero(mask(bounded_spike_times, start_t, stop_t, at_end=True) == True)
+        for ind, (start_t, stop_t) in enumerate(windows)]
+    return np.array(counts) / (window_size*10**-3)
 
 
 peel_nesting = lambda a_l: [a_s for a in a_l for a_s in a]
@@ -191,24 +239,39 @@ non_pause_bounds = [non_pause for non_pause_bound in non_pause_bounds for non_pa
 chunks = _split_pause_chunks()
 stim_bounds = peel_nesting([_find_stim_bounds(*bound, stim) for bound, stim in zip(non_pause_bounds, chunks)])
 print(stim_bounds[4])
-sub_stim_bounds = _find_sub_stim_bounds(*stim_bounds[3])
-print(sub_stim_bounds['rep_0'])
+sub_stim_bounds = _find_sub_stim_bounds(*stim_bounds[4])
+print(sub_stim_bounds)
 # The spikes occurring within bound of stimuli time can now be extracted per cluster.
 print(f'epoch: {(prune_times[48]-prune_times[46]) - stim_bounds[3][3][1]}')
-
-epoch_t = spiketimes_within_bounds(cl_spiketimes,sub_stim_bounds['rep_0'])
 
 # load example spike_times for cluster 10
 normalize = lambda a_l: (a_l - min(a_l)) / (max(a_l) - min(a_l))
 cl_spiketimes = np.load("ss/analysis/data/cluster_10.npy") / 20000
 cl_epoch = cl_spiketimes[np.logical_and(cl_spiketimes >= prune_times[120], cl_spiketimes <= prune_times[127])]
-cl_epoch_n = normalize(cl_epoch)
+heatmap = create_PSTH(cl_epoch)
+ht = heatmap.reshape(1, len(heatmap))
+fig, ax = plt.subplots(figsize=(1,10))
+sns.heatmap(ht, xticklabels=False, yticklabels=False)
 counts, bins = np.histogram(cl_epoch, bins='auto')
-plt.hist(cl_epoch_n, bins=9)
+
+epoch_t = spiketimes_within_bounds(cl_spiketimes,sub_stim_bounds['rep_1'])
+print(epoch_t['epoch'].shape)
+plt.hist(cl_epoch_n, bins='auto')
+
+
+
 # ---------------------
 #   Testing components
 # ---------------------
-
+def _test_chunk(s_b, st_b, w_s, s):
+    # Won't work cleanly when (st_b - w_s) mod(s) != 0
+    t_s = int(((st_b - w_s) - s_b) // s)
+    cn = s_b
+    for i in range(t_s+1):
+        b_b = cn, cn+w_s
+        cn += s
+        yield b_b if i != t_s else (cn, st_b)
+list(_test_chunk(0,3,0.05,0.01))
 # time per epoch = pre_time + stim_time + tail_time
 # num of epochs = stimulus_reps + step_sizes
 #inter family time = len(step_sizes) * inter_family_interval
