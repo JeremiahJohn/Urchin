@@ -42,6 +42,12 @@ class Urchin:
         # on_times, off_times = self.times[self.pulses == 128], self.times[self.pulses == 0]
         return pulses, times
 
+    def find_stim(self, stim_name):
+        """ Get JSON config for particular stim given name."""
+        for stim in self.config['loggedStimuli']:
+            if (stim['protocolName'] == stim_name):
+                return stim
+
     def split_into_stimuli(self):
         """ Split TTL pulses to bound each stimuli in experiment.
 
@@ -60,28 +66,26 @@ class Urchin:
         remove_nones = lambda a_l: [a for a in a_l if a is not None]
         peel_nesting = lambda a_l: [a_s for a in a_l for a_s in a]
         # Begin separating.
-        # slice stim_sum as timing_info (last item) is not necessary when finding pauses.
-        pause_bounds = remove_nones([self._find_pauses(ind,interval,self.stim_sum[:2]) for ind, interval in intervals])
+        # slice stim_sum, as timing_info (last item) is not necessary when finding pauses.
+        # Find bounds of each Pause in experiment
+        pause_bounds = remove_nones([self._find_pauses(ind,interval,self.stim_sum) for ind, interval in intervals])
+        # Find bounds between each Pause
         non_pause_bounds = peel_nesting([self._find_non_pause_bounds(ind, bound, pause_bounds) for ind, bound in enumerate(pause_bounds)])
+        # Get all stimuli in bounds between Pause (non_pause_bounds), including leftmost Pause.
         chunks = self._split_pause_chunks(self.stim_sum)
-        stim_test = peel_nesting([self._find_stim_bounds(*bound, stim) for bound, stim in zip(non_pause_bounds, chunks)])
+        # Use total time of stimulus calculated in _extract_stim_times to find bounds for each stimulus.
+        stim_bounds = peel_nesting([self._find_stim_bounds(*bound, stim) for bound, stim in zip(non_pause_bounds, chunks)])
 
-        return stim_test
+        return stim_bounds
 
-    def find_stim(stim_name):
-        """ Get JSON config for particular stim given name."""
-        for stim in stim_list:
-            if (stim['protocolName'] == stim_name):
-                return stim
-
-    def split_into_sub_stimuli(name, start_bound, stop_bound, timing_info):
+    def split_into_sub_stimuli(self, name, start_bound, stop_bound, timing_info):
         """ For most stimuli, the actual stimulus is repeated in each epoch; sub-stimulus bounds must be extracted.
             To determine how many bounds to make (epoch_num), and the time of each bound (epoch_time).
 
             Parameters
             ----------
             timing_info: list
-                        [epoch_num, epoch_time, interval_time]
+                        [epoch_num, epoch_time, inter_rep_time]
 
             Returns
             -------
@@ -89,7 +93,7 @@ class Urchin:
                 Nested, with keys for each repetition ('rep_{i}').
                 Within each rep_i is a dict with keys ({stim_option in stim_options} or 'epoch').
         """
-        epoch_num, epoch_time, interval_time = timing_info
+        epoch_num, epoch_time, inter_stim_time, inter_rep_time = timing_info
         # To get label for each epoch by stimulus options (i.e. orientation, intensity)
         valid_option = lambda opt, st: list(compress(opt, [op in st for op in opt]))
         # chunk()
@@ -113,12 +117,20 @@ class Urchin:
         sub_rep_ends, sub_epoch_ends = [], []
         for _ in range(rep_num):
             sub_epoch_ends = []
+            if inter_rep_time != 0:
+                # Finds index in on_times matching inter_rep_time (first thing to happen in rep)
+                inter_rep_ind = self._separate_stims(start_bound, stop_bound, inter_rep_time)
+                start_bound += inter_rep_ind-start_bound if inter_rep_ind is not None else 0
+
             for option in range( (len(stim_options) if isinstance(stim_options,list) else stim_options) ):
-                sub_epoch_ends.append([start_bound, self._separate_stims(start_bound,stop_bound, epoch_time)])
+                if inter_stim_time != 0:
+                    # Finds index in on_times within epoch_time matching inter_rep_time, (first thing to happen in epoch_time)
+                    inter_stim_ind = self._separate_stims(start_bound, stop_bound, inter_stim_time)
+                    start_bound += inter_stim_ind-start_bound if inter_stim_ind is not None else 0
+
+                sub_epoch_ends.append([start_bound, self._separate_stims(start_bound, stop_bound, epoch_time-inter_stim_time)])
                 start_bound += sub_epoch_ends[option][1]-start_bound if sub_epoch_ends[option][1] is not None else 0
-                if interval_time != 0:
-                    sub_epoch_ends.append([start_bound, self._separate_stims(start_bound,stop_bound, interval_time)])
-                    start_bound += sub_epoch_ends[option][1]-start_bound if sub_epoch_ends[option][1] is not None else 0
+
             sub_rep_ends.append(sub_epoch_ends)
 
         sub_ends = {f'rep_{ind_r}':{f'{opt_label}':e_bounds for opt_label, e_bounds in zip(
@@ -137,8 +149,8 @@ class Urchin:
                         The cluster(s) from which spike_times will be extracted. If list,
                         style must match self.extracted_clusters. i.e. length of 'total number of groups'
                         and cluster_ids in list at index corresponding to group_idx.
-            bounds: dict
-                        Provided from split_into_stimuli, can be either one repetition, or
+            bounds: dict or list pair.
+                        Provided from split_into_sub_stimuli, can be one repetition, all repetitions, or
                         one bound range (i.e. [start_bound, stop_bound]).
             Returns
             -------
@@ -146,40 +158,46 @@ class Urchin:
                             The spike times within specified bound(s). Matches order of 'cluster_id' parameter.
         """
         # Mask finds times within bounds.
-        mask = lambda a_l, st, stp: np.logical_and(a_l >= self.on_times[st], a_l <= self.on_time[stp])
-        # Grouper extracts spike_times for clusters in 'cluster_id' (assumes stye of self.extracted_clusters)
+        mask = lambda a_l, st, stp: a_l[np.logical_and(a_l >= self.on_times[st], a_l <= self.on_times[stp])]
+        peel_nesting = lambda a_l: [a_s for a in a_l for a_s in a]
+        # Grouper extracts spike_times for clusters in 'cluster_id' (assumes style of self.extracted_clusters)
         def _grouper(c_idxs):
-            for g_id, c_ids in enumerate(c_idxs):
-                if c_ids != 0:
-                    for c_id in c_ids:
-                        # g_id + 1 as g_id is zero indexed, but group folders are 1 indexed.
-                        yield _extract_spiketimes(g_id+1, c_id)
+            # g_id + 1 as g_id is zero indexed, but group folders are 1 indexed.
+            # The order of cluster_ids in c_idx is maintained below, to allow
+            # mapping of unlabeled spike_times to cluster_id.
+            return [self._extract_spiketimes(g_id+1, c_ids) for g_id, c_ids in enumerate(c_idxs) if c_ids != 0]
 
         if isinstance(bounds, dict) and isinstance(cluster_id, int):
             # Multiple sub-stimuli bounds are provided, and spike_times holds one cluster.
             assert group_idx is not None
-            spike_times = _extract_spiketimes(group_idx, cluster_id)
-            return {option:spike_times[mask(spike_times, bound[0], bound[1])] for option, bound in bounds.items()}
+            spike_times = self._extract_spiketimes(group_idx, [cluster_id])
+            return {rep:{option:mask(spike_times, bound[0], bound[1]) for option, bound in epochs.items()} for rep, epochs in bounds.items()}
         elif isinstance(bounds, dict) and isinstance(cluster_id, list):
             # Multiple sub-stimuli bounds are provided, but spike_times holds multiple clusters.
-            return {option:[s_t[mask(s_t, bound[0], bound[1])] for s_t in list(_grouper(cluster_id))] for option, bound in bounds.items()}
+            # peel nesting because of format output of _extract_spiketimes.
+            total_spike_times = peel_nesting(_grouper(cluster_id))
+            return {rep:
+                {option:[mask(spike_times, bound[0], bound[1]) for spike_times in total_spike_times] for option, bound in epochs.items()}
+                for rep, epochs in bounds.items()}
         elif isinstance(cluster_id, list):
             # Single bounds is provided, but spike_times holds multiple clusters.
-            asssert group_idx is not None
             start_bound, stop_bound = bounds
-            spike_times = _extract_spiketimes(group_idx, cluster_id)
-            return [spike_times[mask(spike_times, start_bound, stop_bound)] for spike_time in spike_times]
+            total_spike_times = peel_nesting(_grouper(cluster_id))
+            return [mask(spike_times, start_bound, stop_bound) for spike_times in total_spike_times]
         else:
             # Single bounds and single cluster.
             assert group_idx is not None
             start_bound, stop_bound = bounds
-            spike_times = _extract_spiketimes(group_idx, cluster_id)
-            return spike_times[mask(spike_times, start_bound, stop_bound)]
+            spike_times = self._extract_spiketimes(group_idx, [cluster_id])
+            return mask(spike_times, start_bound, stop_bound)
 
-    def generate_PSTH(self, bounded_spike_times, window_size=50, step=10):
+    def generate_PSTH(self, start_ind, stop_ind, bounded_spike_times, window_size=50, step=10):
         """ Generate peri-stimulus time histogram for given spike_times bounded by stimulus epoch times.
             Parameters
             ----------
+            start_time, stop_time: float
+                                The time bound is the start (or stop) time for the beginning (or end) of the stimulus.
+                                This is irrespective of the first and last spikes in this duration (see note below).
             bounded_spike_times: numpy.ndarray
                                 An array of spike_times for a cluster that falls between sub-stimulus bounds.
                                 Each row in value for key 'option' in stim_options returned from extract_spiketimes_within_bounds.
@@ -193,7 +211,10 @@ class Urchin:
             list
                 list of counts of spikes occurring within striding window
         """
-        start_time, stop_time = bounded_spike_times[0], bounded_spike_times[-1:]
+        # start_time, stop_time = bounded_spike_times[0], bounded_spike_times[-1:]
+        # Note: the above should not be how start and stop is found, as this limits search to the first spike in the time duration of
+        # the stimulus to the last spike. Instead, the bounds should be the start and stop of the stim, irrespective of any spikes.
+        start_time, stop_time = self.on_times[start_ind], self.on_times[stop_ind]
 
         mask = lambda a_l, st, stp, at_end=False: np.logical_and(a_l >= st, a_l < stp) if not at_end else np.logical_and(a_l >= st, a_l <= stp)
         # chunk to return generator with premade windows to look at bounded_spike_times through.
@@ -219,7 +240,7 @@ class Urchin:
     def generate_RF(self):
         """ Generate receptive field for given spike times of cluster_id."""
 
-    def _extract_spiketimes(self, group_idx, cluster_id):
+    def _extract_spiketimes(self, group_idx, cluster_ids):
         """ Extract spike times from given group_idx (group directory) and cluster_id.
             Parameters
             ---------
@@ -227,7 +248,8 @@ class Urchin:
                         This is the int representation of the group, without leading zeros
                         e.g. group '001' on disk is 1 in parameter.
             cluster_id: int
-                        This is one cluster_id (requiring group_idx)
+                        This is a list of cluster_ids (requiring group_idx) to minimize the
+                        number of redundant calls to np.load
             Returns
             -------
             numpy.ndarray
@@ -246,12 +268,14 @@ class Urchin:
         # 'grp_spiketimes' is a list of every spike time in the group
         # 'grp_spikeclusters' is a list mapping cluster_id to the times in 'grp_spiketimes'
         grp_spikeclusters, grp_spiketimes = meta_spike(group_idx)
-        return _extract(grp_spikeclusters, grp_spiketimes, cluster_id)
+        return [_extract(grp_spikeclusters, grp_spiketimes, cluster_id) for cluster_id in cluster_ids]
 
     def _extract_clusters(self):
         """ Go through given data directory and assemble list of cluster_id's
             as a 2x2 matrix with row index as group_idx-1, and each row element as
             'good' labelled cluster_id's for group_idx.
+
+            Note that cluster_id's are specific to its group, not across groups.
         """
 
         # Step one: get list of groups from path
@@ -263,7 +287,7 @@ class Urchin:
         for group_idx in groups:
             try:
                 with open(f'{self.path_to_sorted_data}/{group_idx}/traces/traces.GUI/cluster_info.tsv') as tab_info:
-                    info = d.reader(tab_info, delimiter='\t', quotechar='"')
+                    info = csv.reader(tab_info, delimiter='\t', quotechar='"')
 
                     #Step three: extract good cluster_id's and append to mapped extracted_clusters list
                     group_ls = [int(row[0]) for row in info if 'good' in row and row[0].isnumeric()]
@@ -293,7 +317,7 @@ class Urchin:
         """ Find pauses given stim_sum (_extract_stim_times), self.on_times intervals >= 25s,
             and current index in intervals.
         """
-        found_pause = [matxh.isclose(sus_pause,interval, rel_tol=0.1) for _,sus_pause, *_ in stim_sum]
+        found_pause = [math.isclose(sus_pause,interval, rel_tol=0.1) for _,sus_pause, *_ in stim_sum]
         return [ind, ind+1] if any(found_pause) else None
 
     def _find_non_pause_bounds(self, ind, bound, pause_bounds):
@@ -313,11 +337,13 @@ class Urchin:
         """ Reorganize stim_sum (_extract_stim_times) to separate stimuli between each pause.
             Each chunk should start with a new Pause.
         """
-        pause_in_stim_sum = [ind for ind, stim in enumerate(stim_sum) for sub in stim if sub == 'Pause']
+        pause_in_stim_sum = [ind for ind, stim in enumerate(stim_sum) if 'Pause' in stim]
         # Use indices and loop from 0 to start of pause_in_stim_sum, then [0]:[1] till [len(pause_in_stim_sum)-1]:len(stim_sum)
         pause_chunks = []
         if not pause_in_stim_sum[0]:
+            # Case for when Pause is at beginning of experiment.
             for ind, cut in enumerate(pause_in_stim_sum):
+                # Cuts out all stimuli between Pauses, or from last Pause till the end of the experiment.
                 if (ind != len(pause_in_stim_sum)-1):
                     pause_chunks.append(stim_sum[cut:pause_in_stim_sum[ind+1]])
                 else:
@@ -325,7 +351,10 @@ class Urchin:
 
             return pause_chunks
         else:
+            # Case for when Pause is not at beginning of experiment.
             for ind, cut in enumerate(pause_in_stim_sum):
+                # Cuts out all stimuli between Pauses, from beginning till first Pause, or from last Pause
+                # till the end of the experiment.
                 if ind == 0:
                     pause_chunks.append(stim_sum[0:cut])
                 elif (ind != len(pause_in_stim_sum)-1):
@@ -335,24 +364,38 @@ class Urchin:
 
             return pause_chunks
 
-    def _separate_stims(self, start_bound, stop_bound, _duration):
+    def _separate_stims(self, start_bound, stop_bound, _duration, re_depth=0):
         """ Separate combination of stims into individuals.
             stop_bound will be upcoming pause, which will stay the same, but
             start_bound MUST be shifted to end index of previous stimulus.
         """
+        # For interStimulusInterval, need to separate interval from actual stimulus.
         time_to_find = self.on_times[start_bound]+ _duration
         times_to_search = self.on_times[start_bound:stop_bound+1]
         # The space between TTL pulses (~half the frame rate) is 0.0834.
         # rtol is 0.003, or 3.58% of the pulse spacing.
         found_time = np.isclose(times_to_search, time_to_find, rtol=0.003, atol=0.01)
         ind_found_time = np.where(found_time == True)[0]
-        return start_bound + ind_found_time[0] if ind_found_time.size != 0 else None
+        # Add some resiliency in separating. Recursion allows shift of bounds by one to skip
+        # a bad start_bound and hopefully find the _duration.
+        if ind_found_time.size != 0:
+            return start_bound + ind_found_time[0]
+        elif re_depth != 1:
+            return self._separate_stims(start_bound+1, stop_bound, _duration, re_depth=1)
+        else:
+            return None
 
     def _find_stim_bounds(self, start_bound, stop_bound, bound_stims):
         """ Find bounds of each stimulus, Pause or non-pause.
             Use non_pause_bounds to search for complete or additive combination of stims.
             Use _separate_stims to find stim start and stop, regardless
             of individual or combination of stim(s) in non-pause bound.
+
+            Parameters
+            ----------
+            bound_stims: list
+                        This is a list of all stimuli found between two Pauses (bounded
+                        by start_bound and stop_bound), which includes the leftmost Pause.
         """
         stim_ends = []
         for ind, (name, sus_stim, *timing_info) in enumerate(bound_stims):
@@ -378,13 +421,16 @@ class Urchin:
         # ('stimulus name', total time, num of epochs, time per epoch, sum of times between epoch)
         # total time = number of epochs * time per epoch + sum of times between each epoch
         for stim in stim_list:
-            epoch_time, epoch_num, interval_time = 0, 1, 0
+            epoch_time, epoch_num, inter_rep_time = 0, 1, 0
             stim_option = next((option for option in stim_options if option in stim), None)
             # stim_option finds stimulus specific key in stim dict.
             epoch_time += stim['_actualPreTime']+stim['_actualStimTime']+stim['_actualTailTime']
-            epoch_time += stim['_actualInterStimulusInterval'] if '_actualInterStimulusInterval' in stim else 0
+            # This is time within epoch between stimulus presentation.
+            inter_stim_time = stim['_actualInterStimulusInterval'] if '_actualInterStimulusInterval' in stim else 0
+            epoch_time += inter_stim_time
             if 'stimulusReps' in stim:
                 epoch_num = stim['stimulusReps'] * len(stim[stim_option]) if stim_option is not None else stim['stimulusReps']
-                interval_time += stim['stimulusReps'] * stim['_actualInterFamilyInterval'] if '_actualInterFamilyInterval' in stim else 0
-            stim_sum.append((stim['protocolName'], epoch_num * epoch_time + interval_time, epoch_num, epoch_time, (interval_time/stim['stimulusReps'] if 'stimulusReps' in stim else interval_time) ))
+                inter_rep_time += stim['stimulusReps'] * stim['_actualInterFamilyInterval'] if '_actualInterFamilyInterval' in stim else 0
+                # Last three elements are timing info: epoch_num, epoch_time (including interStimulusInterval) and interFamilyInterval (if relevent).
+            stim_sum.append((stim['protocolName'], epoch_num * epoch_time + inter_rep_time, epoch_num, epoch_time, inter_stim_time, (inter_rep_time/stim['stimulusReps'] if 'stimulusReps' in stim else inter_rep_time) ))
         return stim_sum

@@ -3,6 +3,7 @@ import json
 import math
 from itertools import compress
 import matplotlib.pyplot as plt
+import scipy.io as sio
 import seaborn as sns; sns.set_theme()
 
 %matplotlib inline
@@ -19,15 +20,16 @@ stim_list = config['loggedStimuli']
 stim_options = ['stepSizes', 'orientations', 'gratingOrientations']
 stim_sum = []
 for stim in stim_list:
-    epoch_time, epoch_num, interval_time = 0, 1, 0
+    epoch_time, epoch_num, inter_rep_time = 0, 1, 0
     stim_option = next((option for option in stim_options if option in stim), None)
 
     epoch_time += stim['_actualPreTime']+stim['_actualStimTime']+stim['_actualTailTime']
-    epoch_time += stim['_actualInterStimulusInterval'] if '_actualInterStimulusInterval' in stim else 0
+    inter_stim_time = stim['_actualInterStimulusInterval'] if '_actualInterStimulusInterval' in stim else 0
+    epoch_time += inter_stim_time
     if 'stimulusReps' in stim:
         epoch_num = stim['stimulusReps'] * len(stim[stim_option]) if stim_option is not None else stim['stimulusReps']
-        interval_time += stim['stimulusReps'] * stim['_actualInterFamilyInterval'] if '_actualInterFamilyInterval' in stim else 0
-    stim_sum.append((stim['protocolName'], epoch_num * epoch_time + interval_time, epoch_num, epoch_time, (interval_time/stim['stimulusReps'] if 'stimulusReps' in stim else interval_time) ))
+        inter_rep_time += stim['stimulusReps'] * stim['_actualInterFamilyInterval'] if '_actualInterFamilyInterval' in stim else 0
+    stim_sum.append((stim['protocolName'], epoch_num * epoch_time + inter_rep_time, epoch_num, epoch_time, inter_stim_time, (inter_rep_time/stim['stimulusReps'] if 'stimulusReps' in stim else interval_time) ))
 
 print(stim_sum)
 print(f'total: {sum([time for _,time in stim_sum])}')
@@ -73,7 +75,7 @@ def _count_stim_type(stim_name, stim_l):
     return [stim_s.count(stim_name) for stim_s in stim_l].count(1)
 
 def _split_pause_chunks():
-    pause_in_stim_sum = [ind for ind, stim in enumerate(stim_sum) for sub in stim if sub == 'Pause']
+    pause_in_stim_sum = [ind for ind, stim in enumerate(stim_sum) if 'Pause' in stim]
     #Use indices and loop from 0 to start of pause_in_stim_sum, then [0]:[1] till [len(pause_in_stim_sum)-1]:len(stim_sum)
     pause_chunks = []
     if not pause_in_stim_sum[0]:
@@ -95,7 +97,7 @@ def _split_pause_chunks():
 
         return pause_chunks
 
-def _separate_stims(start_bound, stop_bound, _duration):
+def _separate_stims(start_bound, stop_bound, _duration, re_count=0):
     # separate combination of stims into individuals.
     # stop_bound will be upcoming pause, which will stay the same for
     # every function call in block of loop.
@@ -105,7 +107,7 @@ def _separate_stims(start_bound, stop_bound, _duration):
     times_to_search = prune_times[start_bound:stop_bound+1]
     found_time = np.isclose(times_to_search, time_to_find, rtol=0.003, atol=0.01)
     ind_found_time = np.where(found_time == True)[0]
-    return start_bound + ind_found_time[0] if ind_found_time.size != 0 else None
+    return start_bound + ind_found_time[0] if ind_found_time.size != 0 else _separate_stims(start_bound+1, stop_bound, _duration, re_count=1) if re_count != 1 else None
 
 # Use non_pause_bounds to search for complete or additive combination of stims.
 def _find_stim_bounds(start_bound, stop_bound, bound_stims):
@@ -140,7 +142,7 @@ def _find_sub_stim_bounds(name, start_bound, stop_bound, timing_info):
     # For most stimuli, the actual stimulus is repeated in each epoch; sub-stimulus bounds must be extracted.
     # To determine how many bounds to make (epoch_num), and the time of each bound (epoch_time).
     # stim_bound is (name, start_bound, stop_bound, [epoch_num, epoch_time, interval_time])
-    epoch_num, epoch_time, interval_time = timing_info
+    epoch_num, epoch_time, inter_stim_time, interval_time = timing_info
     # To get label for each epoch by change to stimulus (i.e. orientation, intensity)
     valid_option = lambda opt, st: list(compress(opt, [op in st for op in opt]))
     def chunk(ar, n):
@@ -158,12 +160,17 @@ def _find_sub_stim_bounds(name, start_bound, stop_bound, timing_info):
     sub_rep_ends, sub_epoch_ends = [], []
     for _ in range(rep_num):
         sub_epoch_ends = []
+        if interval_time != 0:
+            inter_rep_ind = _separate_stims(start_bound, stop_bound, interval_time)
+            start_bound += inter_rep_ind - start_bound if inter_rep_ind is not None else 0
         for option in range( (len(stim_options) if isinstance(stim_options,list) else stim_options) ):
-            sub_epoch_ends.append([start_bound, _separate_stims(start_bound,stop_bound, epoch_time)])
+            # inter_stim_time
+            if inter_stim_time != 0:
+                inter_stim_ind = _separate_stims(start_bound, stop_bound, inter_stim_time)
+                start_bound += inter_stim_ind-start_bound if inter_stim_ind is not None else 0
+
+            sub_epoch_ends.append([start_bound, _separate_stims(start_bound,stop_bound, epoch_time-inter_stim_time)])
             start_bound += sub_epoch_ends[option][1]-start_bound if sub_epoch_ends[option][1] is not None else 0
-            if interval_time != 0:
-                sub_epoch_ends.append([start_bound, _separate_stims(start_bound,stop_bound, interval_time)])
-                start_bound += sub_epoch_ends[option][1]-start_bound if sub_epoch_ends[option][1] is not None else 0
 
         sub_rep_ends.append(sub_epoch_ends)
 
@@ -197,7 +204,7 @@ def spiketimes_within_bounds(spike_times, bounds):
         return {option:[s_t[mask(s_t, bound[0], bound[1])] for s_t in list(_grouper(cluster_id))] for option, bound in bounds.items()}
     elif isinstance(cluster_id, list):
         # Single bounds is provided, but spike_times holds multiple clusters.
-        asssert group_idx is not None
+        assert group_idx is not None
         start_bound, stop_bound = bounds
         spike_times = _extract_spiketimes(group_idx, cluster_id)
         return [spike_times[mask(spike_times, start_bound, stop_bound)] for spike_time in spike_times]
@@ -208,8 +215,8 @@ def spiketimes_within_bounds(spike_times, bounds):
         spike_times = _extract_spiketimes(group_idx, cluster_id)
         return spike_times[mask(spike_times, start_bound, stop_bound)]
 
-def create_PSTH(bounded_spike_times, window_size=50, step=10):
-    start_time, stop_time = bounded_spike_times[0], bounded_spike_times[-1:]
+def create_PSTH( actual_start_time, actual_stop_time, bounded_spike_times, window_size=50, step=10):
+    start_time, stop_time = actual_start_time, actual_stop_time
 
     mask = lambda a_l, st, stp, at_end=False: np.logical_and(a_l >= st, a_l < stp) if not at_end else np.logical_and(a_l >= st, a_l <= stp)
     # chunk to return generator with premade windows to look at bounded_spike_times through.
@@ -229,7 +236,7 @@ def create_PSTH(bounded_spike_times, window_size=50, step=10):
     counts = [np.count_nonzero(mask(bounded_spike_times, start_t, stop_t) == True) if ind != len(windows)-1
         else np.count_nonzero(mask(bounded_spike_times, start_t, stop_t, at_end=True) == True)
         for ind, (start_t, stop_t) in enumerate(windows)]
-    return np.array(counts) / (window_size*10**-3)
+    return (np.array(counts) / (window_size*10**-3)), windows
 
 
 peel_nesting = lambda a_l: [a_s for a in a_l for a_s in a]
@@ -242,24 +249,40 @@ print(stim_bounds[4])
 sub_stim_bounds = _find_sub_stim_bounds(*stim_bounds[4])
 print(sub_stim_bounds)
 # The spikes occurring within bound of stimuli time can now be extracted per cluster.
-print(f'epoch: {(prune_times[48]-prune_times[46]) - stim_bounds[3][3][1]}')
+print(f'epoch: {(prune_times[127]-prune_times[126])} and actual: {stim_bounds[1][3][1]}')
 
 # load example spike_times for cluster 10
 normalize = lambda a_l: (a_l - min(a_l)) / (max(a_l) - min(a_l))
 cl_spiketimes = np.load("ss/analysis/data/cluster_10.npy") / 20000
-cl_epoch = cl_spiketimes[np.logical_and(cl_spiketimes >= prune_times[120], cl_spiketimes <= prune_times[127])]
-heatmap = create_PSTH(cl_epoch)
+print(f'start: {prune_times[123]-prune_times[122]}')
+_mask_test = lambda a_l, st, stp: np.logical_and(a_l >= prune_times[st], a_l <= prune_times[stp])
+cl_epoch = cl_spiketimes[_mask_test(cl_spiketimes, 126, 127)]
+heatmap, window_ref = create_PSTH(prune_times[126], prune_times[127], cl_epoch)
+plt.plot(heatmap)
+# Looking at where pre-time, stim-time, and post-time happens on heatmap.
+print(f'start: {window_ref[208][1] - window_ref[-1][0]}')
+print(f'shape: {len(heatmap)}')
 ht = heatmap.reshape(1, len(heatmap))
-fig, ax = plt.subplots(figsize=(1,10))
-sns.heatmap(ht, xticklabels=False, yticklabels=False)
+# fig, ax = plt.subplots(figsize=(1,10))
+sns.heatmap(ht, yticklabels=False, linewidths=0)
 counts, bins = np.histogram(cl_epoch, bins='auto')
-
+## total heatmap test ##
+total_heatmap = np.load("ss/analysis/data/total_heatmap.npy")
+initial_heatmap = sns.heatmap(total_heatmap, yticklabels=False, linewidths=0)
+# Save: initial_heatmap.get_figure().savefig('initial_heatmap.png', dpi=400)
 epoch_t = spiketimes_within_bounds(cl_spiketimes,sub_stim_bounds['rep_1'])
 print(epoch_t['epoch'].shape)
 plt.hist(cl_epoch_n, bins='auto')
 
 
-
+m_cont = sio.loadmat('/Users/jeremiahjohn/Library/CloudStorage/Box-Box/Dunn Lab/Users/Jeremiah/exampleSpikeData.mat')
+print(m_cont['firingRates'].shape)
+print(f'start: {m_cont["spikeTimes"][0][0]}')
+ex_s_t = m_cont['spikeTimes'][0] / 1000
+ex_heatmap, ex_window_ref = create_PSTH(0, ex_s_t[-1]+0.5, ex_s_t, window_size=40)
+print(f'ex_heatmap: {ex_heatmap.shape} and ans: {m_cont["firingRates"][0].shape}')
+plt.plot(m_cont['firingRates'][0])
+plt.plot(ex_heatmap)
 # ---------------------
 #   Testing components
 # ---------------------
@@ -272,6 +295,9 @@ def _test_chunk(s_b, st_b, w_s, s):
         cn += s
         yield b_b if i != t_s else (cn, st_b)
 list(_test_chunk(0,3,0.05,0.01))
+
+
+
 # time per epoch = pre_time + stim_time + tail_time
 # num of epochs = stimulus_reps + step_sizes
 #inter family time = len(step_sizes) * inter_family_interval
