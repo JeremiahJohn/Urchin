@@ -103,11 +103,12 @@ def _separate_stims(start_bound, stop_bound, _duration, re_count=0):
     # every function call in block of loop.
     # The space between TTL pulses (~half the frame rate) is 0.0834.
     # rtol is 0.003, or 3.58% of the pulse spacing.
+    # atol is 0.01.
     time_to_find = prune_times[start_bound]+ _duration
     times_to_search = prune_times[start_bound:stop_bound+1]
-    found_time = np.isclose(times_to_search, time_to_find, rtol=0.003, atol=0.01)
+    found_time = np.isclose(times_to_search, time_to_find, rtol=0.001, atol=0.01)
     ind_found_time = np.where(found_time == True)[0]
-    return start_bound + ind_found_time[0] if ind_found_time.size != 0 else _separate_stims(start_bound+1, stop_bound, _duration, re_count=1) if re_count != 1 else None
+    return (start_bound, start_bound + ind_found_time[0]) if ind_found_time.size != 0 else _separate_stims(start_bound+1, stop_bound, _duration, re_count=1) if re_count != 1 else None
 
 # Use non_pause_bounds to search for complete or additive combination of stims.
 def _find_stim_bounds(start_bound, stop_bound, bound_stims):
@@ -121,9 +122,11 @@ def _find_stim_bounds(start_bound, stop_bound, bound_stims):
         if name == 'Pause':
             # Since non_pause_bounds does not include pause indices (beginning), adjust so pause can be found too.
             # This is for the sake of accurate start_bound shifting.
-            stim_ends.append([name, start_bound-2, _separate_stims(start_bound-2, stop_bound, sus_stim), timing_info])
+            str_bnd, stp_bnd = _separate_stims(start_bound-2, stop_bound, sus_stim)
+            stim_ends.append([name, str_bnd, stp_bnd, timing_info])
         else:
-            stim_ends.append([name, start_bound, _separate_stims(start_bound, stop_bound, sus_stim), timing_info])
+            str_bnd, stp_bnd = _separate_stims(start_bound, stop_bound, sus_stim)
+            stim_ends.append([name, str_bnd, stp_bnd, timing_info])
 
         start_bound += stim_ends[ind][2]-start_bound if stim_ends[ind][2] is not None else 0
 
@@ -161,15 +164,16 @@ def _find_sub_stim_bounds(name, start_bound, stop_bound, timing_info):
     for _ in range(rep_num):
         sub_epoch_ends = []
         if interval_time != 0:
-            inter_rep_ind = _separate_stims(start_bound, stop_bound, interval_time)
+            _, inter_rep_ind = _separate_stims(start_bound, stop_bound, interval_time)
             start_bound += inter_rep_ind - start_bound if inter_rep_ind is not None else 0
         for option in range( (len(stim_options) if isinstance(stim_options,list) else stim_options) ):
             # inter_stim_time
             if inter_stim_time != 0:
-                inter_stim_ind = _separate_stims(start_bound, stop_bound, inter_stim_time)
+                _, inter_stim_ind = _separate_stims(start_bound, stop_bound, inter_stim_time)
                 start_bound += inter_stim_ind-start_bound if inter_stim_ind is not None else 0
 
-            sub_epoch_ends.append([start_bound, _separate_stims(start_bound,stop_bound, epoch_time-inter_stim_time)])
+            mod_start_bound, duration_bound = _separate_stims(start_bound,stop_bound, epoch_time-inter_stim_time)
+            sub_epoch_ends.append([mod_start_bound, duration_bound])
             start_bound += sub_epoch_ends[option][1]-start_bound if sub_epoch_ends[option][1] is not None else 0
 
         sub_rep_ends.append(sub_epoch_ends)
@@ -182,38 +186,41 @@ def _find_sub_stim_bounds(name, start_bound, stop_bound, timing_info):
     # sub_stim_ends = {f'epoch_{ind}':epoch_bounds for ind, epoch_bounds in zip(range(epoch_num), sub_stim_ends)}
     return sub_ends
 
-def spiketimes_within_bounds(spike_times, bounds):
+def spiketimes_within_bounds(cluster_id, bounds, group_idx=None):
     """ Extract spike times that occur between bound in bounds."""
     # Mask finds times within bounds.
     mask = lambda a_l, st, stp: np.logical_and(a_l >= prune_times[st], a_l <= prune_times[stp])
-    # Grouper extracts spike_times for clusters in 'cluster_id' (assumes stye of self.extracted_clusters)
+    peel_nesting = lambda a_l: [a_s for a in a_l for a_s in a]
+    # Grouper extracts spike_times for clusters in 'cluster_id' (assumes style of self.extracted_clusters)
     def _grouper(c_idxs):
-        for g_id, c_ids in enumerate(c_idxs):
-            if c_ids != 0:
-                for c_id in c_ids:
-                    # g_id + 1 as g_id is zero indexed, but group folders are 1 indexed.
-                    yield _extract_spiketimes(g_id+1, c_id)
+        # g_id + 1 as g_id is zero indexed, but group folders are 1 indexed.
+        # The order of cluster_ids in c_idx is maintained below, to allow
+        # mapping of unlabeled spike_times to cluster_id.
+        return [_extract_spiketimes(g_id+1, c_ids) for g_id, c_ids in enumerate(c_idxs) if c_ids != 0]
 
     if isinstance(bounds, dict) and isinstance(cluster_id, int):
         # Multiple sub-stimuli bounds are provided, and spike_times holds one cluster.
         assert group_idx is not None
-        spike_times = _extract_spiketimes(group_idx, cluster_id)
-        return {option:spike_times[mask(spike_times, bound[0], bound[1])] for option, bound in bounds.items()}
+        spike_times = _extract_spiketimes(group_idx, [cluster_id])
+        return {rep:{option:mask(spike_times, bound[0], bound[1]) for option, bound in epochs.items()} for rep, epochs in bounds.items()}
     elif isinstance(bounds, dict) and isinstance(cluster_id, list):
         # Multiple sub-stimuli bounds are provided, but spike_times holds multiple clusters.
-        return {option:[s_t[mask(s_t, bound[0], bound[1])] for s_t in list(_grouper(cluster_id))] for option, bound in bounds.items()}
+        # peel nesting because of format output of _extract_spiketimes.
+        total_spike_times = peel_nesting(_grouper(cluster_id))
+        return {rep:
+            {option:[mask(spike_times, bound[0], bound[1]) for spike_times in total_spike_times] for option, bound in epochs.items()}
+            for rep, epochs in bounds.items()}
     elif isinstance(cluster_id, list):
         # Single bounds is provided, but spike_times holds multiple clusters.
-        assert group_idx is not None
         start_bound, stop_bound = bounds
-        spike_times = _extract_spiketimes(group_idx, cluster_id)
-        return [spike_times[mask(spike_times, start_bound, stop_bound)] for spike_time in spike_times]
+        total_spike_times = peel_nesting(_grouper(cluster_id))
+        return [mask(spike_times, start_bound, stop_bound) for spike_times in total_spike_times]
     else:
         # Single bounds and single cluster.
         assert group_idx is not None
         start_bound, stop_bound = bounds
-        spike_times = _extract_spiketimes(group_idx, cluster_id)
-        return spike_times[mask(spike_times, start_bound, stop_bound)]
+        spike_times = _extract_spiketimes(group_idx, [cluster_id])
+        return mask(spike_times, start_bound, stop_bound)
 
 def create_PSTH( actual_start_time, actual_stop_time, bounded_spike_times, window_size=50, step=10):
     start_time, stop_time = actual_start_time, actual_stop_time
@@ -245,19 +252,19 @@ non_pause_bounds = [_find_non_pause_bounds(ind, bound) for ind, bound in enumera
 non_pause_bounds = [non_pause for non_pause_bound in non_pause_bounds for non_pause in non_pause_bound]
 chunks = _split_pause_chunks()
 stim_bounds = peel_nesting([_find_stim_bounds(*bound, stim) for bound, stim in zip(non_pause_bounds, chunks)])
-print(stim_bounds[4])
-sub_stim_bounds = _find_sub_stim_bounds(*stim_bounds[4])
+print(stim_bounds[3])
+sub_stim_bounds = _find_sub_stim_bounds(*stim_bounds[3])
 print(sub_stim_bounds)
 # The spikes occurring within bound of stimuli time can now be extracted per cluster.
-print(f'epoch: {(prune_times[127]-prune_times[126])} and actual: {stim_bounds[1][3][1]}')
-
+print(f'epoch: {(prune_times[46]-prune_times[44])} and actual: {stim_bounds[1][3][1]}')
+prune_times[43:47]
 # load example spike_times for cluster 10
 normalize = lambda a_l: (a_l - min(a_l)) / (max(a_l) - min(a_l))
 cl_spiketimes = np.load("ss/analysis/data/cluster_10.npy") / 20000
 print(f'start: {prune_times[123]-prune_times[122]}')
-_mask_test = lambda a_l, st, stp: np.logical_and(a_l >= prune_times[st], a_l <= prune_times[stp])
-cl_epoch = cl_spiketimes[_mask_test(cl_spiketimes, 126, 127)]
-heatmap, window_ref = create_PSTH(prune_times[126], prune_times[127], cl_epoch)
+_mask_test = lambda a_l, st, stp: np.logical_and(a_l > prune_times[st], a_l < prune_times[stp])
+cl_epoch = cl_spiketimes[_mask_test(cl_spiketimes, 46, 48)]
+heatmap, window_ref = create_PSTH(prune_times[46], prune_times[48], cl_epoch)
 plt.plot(heatmap)
 # Looking at where pre-time, stim-time, and post-time happens on heatmap.
 print(f'start: {window_ref[208][1] - window_ref[-1][0]}')
@@ -270,11 +277,24 @@ counts, bins = np.histogram(cl_epoch, bins='auto')
 total_heatmap = np.load("ss/analysis/data/total_heatmap.npy")
 initial_heatmap = sns.heatmap(total_heatmap, yticklabels=False, linewidths=0)
 # Save: initial_heatmap.get_figure().savefig('initial_heatmap.png', dpi=400)
-epoch_t = spiketimes_within_bounds(cl_spiketimes,sub_stim_bounds['rep_1'])
-print(epoch_t['epoch'].shape)
-plt.hist(cl_epoch_n, bins='auto')
 
+## Test orientation based FR ##
+orientation_FR = np.load("ss/analysis/data/avg_orientation_FR.npy", allow_pickle=True)
+max_orientation_FR = np.load("ss/analysis/data/PSTH_avg_orientation_FR.npy")
+orientation_counts = np.load("ss/analysis/data/avg_orientation_counts.npy")
+flash_FR = np.load("ss/analysis/data/avg_flash_FR.npy")
+sns.heatmap(flash_FR[50:59], yticklabels=False, linewidths=0)
+orientation_counts[:,0]
+plt.polar((np.array(_find_stim('MovingBar')['orientations'])*math.pi/180), orientation_FR[:,60])
 
+orientation_FR[:,3]
+## Comparison test ##
+euclidean_dist = lambda x,y: np.sqrt(np.sum((x-y)**2))
+cos_sim = lambda x,y: np.dot(x,y)/(np.linalg.norm(x)*np.linalg.norm(y))
+cos_sim(flash_FR[57], flash_FR[60])
+sns.heatmap(total_heatmap[50:72], linewidths=0)
+
+## PSTH test ##
 m_cont = sio.loadmat('/Users/jeremiahjohn/Library/CloudStorage/Box-Box/Dunn Lab/Users/Jeremiah/exampleSpikeData.mat')
 print(m_cont['firingRates'].shape)
 print(f'start: {m_cont["spikeTimes"][0][0]}')

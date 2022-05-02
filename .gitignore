@@ -1,1 +1,7 @@
 .DS_Store
+Urchin/
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+test_runtime.py

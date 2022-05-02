@@ -119,16 +119,19 @@ class Urchin:
             sub_epoch_ends = []
             if inter_rep_time != 0:
                 # Finds index in on_times matching inter_rep_time (first thing to happen in rep)
-                inter_rep_ind = self._separate_stims(start_bound, stop_bound, inter_rep_time)
+                # _separate_stims returns start and stop bounds, in case start_bound had to be modified to capture duration.
+                inter_rep_ind = self._separate_stims(start_bound, stop_bound, inter_rep_time)[1]
                 start_bound += inter_rep_ind-start_bound if inter_rep_ind is not None else 0
 
             for option in range( (len(stim_options) if isinstance(stim_options,list) else stim_options) ):
                 if inter_stim_time != 0:
                     # Finds index in on_times within epoch_time matching inter_rep_time, (first thing to happen in epoch_time)
-                    inter_stim_ind = self._separate_stims(start_bound, stop_bound, inter_stim_time)
+                    # _separate_stims returns start and stop bounds, in case start_bound had to be modified to capture duration.
+                    inter_stim_ind = self._separate_stims(start_bound, stop_bound, inter_stim_time)[1]
                     start_bound += inter_stim_ind-start_bound if inter_stim_ind is not None else 0
-
-                sub_epoch_ends.append([start_bound, self._separate_stims(start_bound, stop_bound, epoch_time-inter_stim_time)])
+                # _separate_stims returns start and stop bounds, in case start_bound had to be modified to capture duration.
+                modified_start_bound, duration_stop_bound = self._separate_stims(start_bound, stop_bound, epoch_time-inter_stim_time)
+                sub_epoch_ends.append([modified_start_bound, duration_stop_bound])
                 start_bound += sub_epoch_ends[option][1]-start_bound if sub_epoch_ends[option][1] is not None else 0
 
             sub_rep_ends.append(sub_epoch_ends)
@@ -236,6 +239,29 @@ class Urchin:
             for ind, (start_t, stop_t) in enumerate(windows)]
         return np.array(counts) / (window_size*10**-3)
 
+    def coarse_FR(self, start_ind, stop_ind, bounded_spike_times):
+        """ Calculate average firing rate for given spike_times bounded by stimulus epoch times.
+            Parameters
+            ----------
+            start_time, stop_time: float
+                                The time bound is the start (or stop) time for the beginning (or end) of the stimulus.
+                                This is irrespective of the first and last spikes in this duration (see note below).
+            bounded_spike_times: numpy.ndarray
+                                An array of spike_times for a cluster that falls between sub-stimulus bounds.
+                                Each row in value for key 'option' in stim_options returned from extract_spiketimes_within_bounds.
+
+            Returns
+            -------
+            float
+                Average firing rate in terms of spikes per second over the sub-stim duration.
+        """
+        # start_time, stop_time = bounded_spike_times[0], bounded_spike_times[-1:]
+        # Note: the above should not be how start and stop is found, as this limits search to the first spike in the time duration of
+        # the stimulus to the last spike. Instead, the bounds should be the start and stop of the stim, irrespective of any spikes.
+        start_time, stop_time = self.on_times[start_ind], self.on_times[stop_ind]
+        # The number of spikes in the broad sub-stimulus time period, to estimate spikes/sec at worse resolution than PSTH.
+        return len(bounded_spike_times)/(stop_time - start_time)
+
 
     def generate_RF(self):
         """ Generate receptive field for given spike times of cluster_id."""
@@ -297,6 +323,16 @@ class Urchin:
             except Exception as e:
                 continue
         return extracted_clusters
+
+    def _compare_PSTH(self, x, y, compare_with='cos'):
+        """ Use cosine similarity to compare two PSTHs from two clusters."""
+        # Euclidean distance falls with intensity of firing.
+        euclidean_dist = lambda x,y: np.sqrt(np.sum((x-y)**2))
+        # Cosine similarity is fine if firing rate is different between x and y, but
+        # compares the spacing of those times more. (0 is dissimilar and 1 is the same)
+        cos_sim = lambda x,y: np.dot(x,y)/(np.linalg.norm(x)*np.linalg.norm(y))
+
+        return cos_sim(x,y) if compare_with == 'cos' else euclidean_dist(x,y)
 
     def _find_cluster_info(self):
         """ Used to extract information for electrical image (ei), such as
@@ -379,7 +415,7 @@ class Urchin:
         # Add some resiliency in separating. Recursion allows shift of bounds by one to skip
         # a bad start_bound and hopefully find the _duration.
         if ind_found_time.size != 0:
-            return start_bound + ind_found_time[0]
+            return start_bound, start_bound + ind_found_time[0]
         elif re_depth != 1:
             return self._separate_stims(start_bound+1, stop_bound, _duration, re_depth=1)
         else:
@@ -402,9 +438,10 @@ class Urchin:
             if name == 'Pause':
                 # Since non_pause_bounds does not include pause indices (beginning), adjust so pause can be found too.
                 # This is for the sake of accurate start_bound shifting.
-                stim_ends.append([name, start_bound-2, self._separate_stims(start_bound-2, stop_bound, sus_stim), timing_info])
+                # _separate_stims returns start and stop bounds, in case start needs to be shifted to capture correct duration.
+                stim_ends.append([name, start_bound-2, self._separate_stims(start_bound-2, stop_bound, sus_stim)[1], timing_info])
             else:
-                stim_ends.append([name, start_bound, self._separate_stims(start_bound, stop_bound, sus_stim), timing_info])
+                stim_ends.append([name, start_bound, self._separate_stims(start_bound, stop_bound, sus_stim)[1], timing_info])
 
             start_bound += stim_ends[ind][2]-start_bound if stim_ends[ind][2] is not None else 0
 
