@@ -4,6 +4,8 @@ import math
 import csv
 from itertools import compress
 import numpy as np
+from scipy.cluster.hierarchy import ward, fcluster
+from scipy.spatial.distance import pdist
 import matplotlib.pyplot as plt
 import h5py
 from phylib.io.model import TemplateModel
@@ -239,6 +241,35 @@ class Urchin:
             for ind, (start_t, stop_t) in enumerate(windows)]
         return np.array(counts) / (window_size*10**-3)
 
+    def sort_PSTH(self, multi_PSTH):
+        """ Group PSTHs together to make analysis (hopefully) easier by using a
+            distance matrix with the cosine distance method followed by ward clustering.
+            Parameters
+            ----------
+            multi_PSTH: ndarray
+                        This is an array of shape (num of clusters, num of windows), holding the PSTH for
+                        multiple clusters in each row of array.
+
+            Returns
+            -------
+            list
+                List of the grouped PSTH responses of len (total_num_groups), with each index being a set of grouped PSTHs.
+        """
+        # A cosine distance method will return NaN due to divide by zero for null vectors in PSTH. Get around this by changing null to ones vectors.
+        multi_PSTH[np.all(multi_PSTH == 0, axis=1)] = [1 for _ in range(multi_PSTH.shape[1])]
+        # Cosine distance is used as this highlights closeness of PSTH distributions in vector space, while not focusing on magnitude.
+        distance_matrix = pdist(multi_PSTH, 'cosine')
+        # Hierarchical clustering is used because we would have to use elbow method to figure out optimal number of groups for k-means, and also
+        # because of the curse of dimensionality for k-means clustering (I think).
+        # ward was chosen mainly because it seemed to find the most clusters.
+        linkage = ward(distance_matrix)
+        # From the linkage matrix, flat clustering can be preformed with a threshold of 0.8.
+        # The smaller the threshold, the less accepting groups will be. Perhaps this threshold might need to be modified for other datasets.
+        groups_ref = fcluster(linkage, 0.8, criterion='distance')
+        # Sort multi_PSTH based on group references in groups_ref.
+        grouped_responses = [multi_PSTH[groups_ref == group_num] for group_num in range(1, groups_ref.max()+1)]
+        return grouped_responses
+
     def coarse_FR(self, start_ind, stop_ind, bounded_spike_times):
         """ Calculate average firing rate for given spike_times bounded by stimulus epoch times.
             Parameters
@@ -262,10 +293,30 @@ class Urchin:
         # The number of spikes in the broad sub-stimulus time period, to estimate spikes/sec at worse resolution than PSTH.
         return len(bounded_spike_times)/(stop_time - start_time)
 
+    def vector_sum_DSI(self, cluster_rates, thetas):
+        """ Compute vector sum DSI as fraction of resultant magnitude in FR magnitudes for each direction.
+            Parameters
+            ----------
+            cluster_rates: ndarray
+                        This is a 1D array of coarse firing rates for one cluster's response to each moving bar
+                        orientation in experiment with rows of array mapped to 'thetas'.
+            thetas: list
+                        A list of orientation angles in radians that maps to 'cluster_rates'.
+
+            Returns
+            -------
+            tuple
+                (DSI, preferred_orientation) where DSI is norm(vector_sum_resultant) / total_magnitude
+                and preferred_orientation is arctan(y/x) for x,y in vector_sum_resultant.
+        """
+        # Sum of FR in each orientation, then the vector_sum coordinates.
+        total_magnitude, resultant = cluster_rates.sum(), self._compute_vector_sum(cluster_rates, thetas)
+        # L2 norm of resultant
+        return np.linalg.norm(resultant)/total_magnitude, np.arctan(resultant[1]/resultant[0])
 
     def generate_RF(self):
         """ Generate receptive field for given spike times of cluster_id."""
-
+        
     def _extract_spiketimes(self, group_idx, cluster_ids):
         """ Extract spike times from given group_idx (group directory) and cluster_id.
             Parameters
@@ -325,14 +376,27 @@ class Urchin:
         return extracted_clusters
 
     def _compare_PSTH(self, x, y, compare_with='cos'):
-        """ Use cosine similarity to compare two PSTHs from two clusters."""
+        """ Use cosine similarity to compare two PSTHs from two clusters. This is a personal
+            implementation of cosine distance, but actual clustering should use cluster_PSTH.
+        """
         # Euclidean distance falls with intensity of firing.
         euclidean_dist = lambda x,y: np.sqrt(np.sum((x-y)**2))
         # Cosine similarity is fine if firing rate is different between x and y, but
         # compares the spacing of those times more. (0 is dissimilar and 1 is the same)
         cos_sim = lambda x,y: np.dot(x,y)/(np.linalg.norm(x)*np.linalg.norm(y))
-
         return cos_sim(x,y) if compare_with == 'cos' else euclidean_dist(x,y)
+
+    def _compute_vector_sum(self, cluster_rates, thetas):
+        """ Calculate the vector sum of polar plot FR of one cluster with the inclusion of non-preferred directions.
+            Finds the cartesian coordinates for this resultant, and also the total magnitude of each orientation-FR
+            vector, so as to aid computation of vector_DSI.
+        """
+        assert cluster_rates.shape[0] == len(thetas)
+        # Transform polar coordinates to cartesian, so as to calculate resultant easily.
+        cartesian_transform = lambda rho, theta: [np.cos(theta)*rho, np.sin(theta)*rho]
+        # Convert cluster FR to cartesian, mapped to 'thetas'.
+        transformed_FR = np.array([cartesian_transform(rho, theta) for rho, theta in zip(cluster_rates, thetas)])
+        return transformed_FR.sum(axis=0)
 
     def _find_cluster_info(self):
         """ Used to extract information for electrical image (ei), such as

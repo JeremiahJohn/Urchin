@@ -1,9 +1,13 @@
 import numpy as np
 import json
 import math
+import pickle
 from itertools import compress
 import matplotlib.pyplot as plt
 import scipy.io as sio
+from scipy.cluster.hierarchy import ward, average, single, centroid, fcluster
+from scipy.cluster.vq import kmeans2
+from scipy.spatial.distance import pdist
 import seaborn as sns; sns.set_theme()
 
 %matplotlib inline
@@ -29,7 +33,7 @@ for stim in stim_list:
     if 'stimulusReps' in stim:
         epoch_num = stim['stimulusReps'] * len(stim[stim_option]) if stim_option is not None else stim['stimulusReps']
         inter_rep_time += stim['stimulusReps'] * stim['_actualInterFamilyInterval'] if '_actualInterFamilyInterval' in stim else 0
-    stim_sum.append((stim['protocolName'], epoch_num * epoch_time + inter_rep_time, epoch_num, epoch_time, inter_stim_time, (inter_rep_time/stim['stimulusReps'] if 'stimulusReps' in stim else interval_time) ))
+    stim_sum.append((stim['protocolName'], epoch_num * epoch_time + inter_rep_time, epoch_num, epoch_time, inter_stim_time, (inter_rep_time/stim['stimulusReps'] if 'stimulusReps' in stim else inter_rep_time) ))
 
 print(stim_sum)
 print(f'total: {sum([time for _,time in stim_sum])}')
@@ -245,6 +249,20 @@ def create_PSTH( actual_start_time, actual_stop_time, bounded_spike_times, windo
         for ind, (start_t, stop_t) in enumerate(windows)]
     return (np.array(counts) / (window_size*10**-3)), windows
 
+def _compute_vector_sum(cluster_rates, thetas):
+    assert cluster_rates.shape[0] == len(thetas)
+    # Transform polar coordinates to cartesian, so as to calculate resultant easily.
+    cartesian_transform = lambda rho, theta: [np.cos(theta)*rho, np.sin(theta)*rho]
+    # Convert cluster FR to cartesian, mapped to 'thetas'.
+    transformed_FR = np.array([cartesian_transform(rho, theta) for rho, theta in zip(cluster_rates, thetas)])
+    return transformed_FR.sum(axis=0)
+
+def vector_sum_DSI(cluster_rates, thetas):
+    # Sum of FR in each orientation, then the vector_sum coordinates.
+    total_magnitude, resultant = cluster_rates.sum(), _compute_vector_sum(cluster_rates, thetas)
+    # L2 norm of resultant
+    return np.linalg.norm(resultant)/total_magnitude, np.arctan(resultant[1]/resultant[0])
+
 
 peel_nesting = lambda a_l: [a_s for a in a_l for a_s in a]
 pause_bounds = [_find_pauses(ind,interval,stim_sum) for ind, interval in intervals if _find_pauses(ind,interval,stim_sum) != None]
@@ -253,10 +271,10 @@ non_pause_bounds = [non_pause for non_pause_bound in non_pause_bounds for non_pa
 chunks = _split_pause_chunks()
 stim_bounds = peel_nesting([_find_stim_bounds(*bound, stim) for bound, stim in zip(non_pause_bounds, chunks)])
 print(stim_bounds[3])
-sub_stim_bounds = _find_sub_stim_bounds(*stim_bounds[3])
+sub_stim_bounds = _find_sub_stim_bounds(*stim_bounds[4])
 print(sub_stim_bounds)
 # The spikes occurring within bound of stimuli time can now be extracted per cluster.
-print(f'epoch: {(prune_times[46]-prune_times[44])} and actual: {stim_bounds[1][3][1]}')
+print(f'epoch: {(prune_times[123]-prune_times[122])} and actual: {stim_bounds[1][3][1]}')
 prune_times[43:47]
 # load example spike_times for cluster 10
 normalize = lambda a_l: (a_l - min(a_l)) / (max(a_l) - min(a_l))
@@ -283,16 +301,62 @@ orientation_FR = np.load("ss/analysis/data/avg_orientation_FR.npy", allow_pickle
 max_orientation_FR = np.load("ss/analysis/data/PSTH_avg_orientation_FR.npy")
 orientation_counts = np.load("ss/analysis/data/avg_orientation_counts.npy")
 flash_FR = np.load("ss/analysis/data/avg_flash_FR.npy")
+with open("ss/analysis/data/spikes_first_flash.pkl", 'rb') as f:
+    spiketimes_first_flash = pickle.load(f)
 sns.heatmap(flash_FR[50:59], yticklabels=False, linewidths=0)
-orientation_counts[:,0]
-plt.polar((np.array(_find_stim('MovingBar')['orientations'])*math.pi/180), orientation_FR[:,60])
+orientation_FR[:,60]
+orientation_rad = np.array(_find_stim('MovingBar')['orientations'])*np.pi/180
+cartesian_transform = lambda rho, theta: (rho*math.cos(theta), rho*math.sin(theta))
+# c: 179, 4, 9, 24, 26, 32, 53, 68, 69, 70 (33, 34, 39, 50, 52)
+c_i = 170
+# cartesian_orientation = np.array([cartesian_transform(rho, theta) for theta, rho in zip(orientation_rad, orientation_FR[:,c_i])])
+# plt.plot(cartesian_orientation[:,0], cartesian_orientation[:,1])
+plt.polar(np.append(orientation_rad, orientation_rad[0]), np.append(orientation_FR[:,c_i], orientation_FR[0,c_i]))
 
-orientation_FR[:,3]
+## DSI test ##
+total_dsi = np.array([vector_sum_DSI(orientation_FR[:,tag], orientation_rad)[0] for tag in range(orientation_FR.shape[1])])
+good_ds = np.where(total_dsi >=0.20)[0]
+good_ds.shape
+sns.histplot(total_dsi)
+
 ## Comparison test ##
 euclidean_dist = lambda x,y: np.sqrt(np.sum((x-y)**2))
 cos_sim = lambda x,y: np.dot(x,y)/(np.linalg.norm(x)*np.linalg.norm(y))
-cos_sim(flash_FR[57], flash_FR[60])
-sns.heatmap(total_heatmap[50:72], linewidths=0)
+cos_sim(total_heatmap[47], total_heatmap[42])
+
+## Clustering with scipy ##
+# using flash_FR, a misnomer as it is the average PSTHs for every cluster.
+# remove null flash responses
+pruned_total_heatmap = flash_FR
+pruned_total_heatmap[np.all(pruned_total_heatmap == 0, axis=1)] = [1 for _ in range(flash_FR.shape[1])]
+# cosine distance method creates divide by zero NaN when there are null vectors in data.
+d_ma = pdist(pruned_total_heatmap, 'cosine')
+d_link = ward(d_ma)
+# c1: threshold 0.3 with ward clustering and hamming distance metric.
+# c2: threshold 0.8 with ward clustering and cosine distance.
+sorted_responses = fcluster(d_link, 0.8, criterion='distance')
+clustered_heatmap = [flash_FR[sorted_responses == g_num] for g_num in range(1, sorted_responses.max()+1)]
+len(clustered_heatmap)
+# c2:
+# ON_transient (16,8,9): [16][[0,8,9,-2]]
+# ON_sustained 11: [11][[2,3,8,13]]
+# OFF_transient (0,1,4): [0][[0,1]], [1][-1:], [4][0]
+# OFF_sustained 5: [5][[1,2,3,-1]]
+# ON-OFF (3,6,7,9,10): [6][4], [9][2], [10][[6,-5]]
+# ON DS flash response characterized in group 13.
+sns.heatmap(clustered_heatmap[16][[0,8,9,-2]],
+            vmin=0,
+            cmap="rocket",
+            cbar_kws={"label": "spikes/s", "shrink": 0.8, "location": "left"},
+            rasterized=True,
+            linewidth=0, xticklabels=0, yticklabels=0)
+plt.savefig("ON_transient_left.svg", format="svg")
+#c1: ON sustained 16, 8, 7. ON burst, then sustained 12
+given_clust = np.where(sorted_responses == 1)
+sns.heatmap(total_heatmap[143:150], linewidths=0)
+# sns.heatmap(total_heatmap[148:150], linewidths=0)
+# ind_li = np.where(sorted_responses == 12)[0]
+# plt.eventplot(spiketimes_first_flash[ind_li[4]])
 
 ## PSTH test ##
 m_cont = sio.loadmat('/Users/jeremiahjohn/Library/CloudStorage/Box-Box/Dunn Lab/Users/Jeremiah/exampleSpikeData.mat')
