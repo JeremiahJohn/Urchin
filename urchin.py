@@ -2,7 +2,7 @@ import os
 import json
 import math
 import csv
-from itertools import compress
+from itertools import compress, chain
 import numpy as np
 from scipy.cluster.hierarchy import ward, fcluster
 from scipy.spatial.distance import pdist
@@ -52,7 +52,7 @@ class Urchin:
         #     if (stim['protocolName'] == stim_name):
         #         return stim
         stim_list = [stim for stim in self.config['loggedStimuli'] if stim['protocolName'] == stim_name]
-        return stim_list if len(stim_list) != 1 else stim_list[0]
+        return stim_list
 
     def split_into_stimuli(self):
         """ Split TTL pulses to bound each stimuli in experiment.
@@ -109,7 +109,7 @@ class Urchin:
 
         stim_options = ['stepSizes', 'orientations', 'gratingOrientations']
         stim_log = ['flashLog', 'orientationLog']
-        current_stim = self.find_stim(name)
+        current_stim = self.find_stim(name)[0]
         # Get valid options (i.e. orientation, intensity) for current_stim from stim_options
         stim_options = current_stim[valid_option(stim_options,current_stim)[0]] if valid_option(stim_options,current_stim) else 1
         # Get log of all options displayed during experiment based on valid stim_option for current_stim
@@ -318,13 +318,16 @@ class Urchin:
         # L2 norm of resultant
         return np.linalg.norm(resultant)/total_magnitude, np.arctan(resultant[1]/resultant[0])
 
-    def generate_RF(self, start_ind, stop_ind, bounded_spike_times, order=0):
+    def generate_RF(self, start_ind, stop_ind, rep_num, bounded_spike_times, order=0, to_collapse=False):
         """ Generate receptive field for given spike times of cluster_id.
             Parameters
             ----------
             start_ind, stop_ind: int
-                                The indices of the time bound is the start (or stop) time for the beginning (or end) of the stimulus.
-                                This is the same as generate_PSTH or coarse_FR.
+                                The indices of the time bound is the start (or stop) time for the beginning (or end) of
+                                the epoch (one epoch per rep) within the stimulus. This is the same as generate_PSTH or coarse_FR.
+            rep_num: int
+                    The current rep number for corresponding start_ind and stop_ind. This is used to extract the correct
+                    page within the checkerboard array.
             bounded_spike_times: numpy.ndarray
                                 An array of spike_times for a cluster that falls between sub-stimulus bounds.
                                 This can be each row in value for key 'option' in stim_options returned from
@@ -332,20 +335,23 @@ class Urchin:
             order: int
                     This is the index of the stim in question, as per order of appearance in JSON config.
                     Default is 0 which isn't used when only one CheckerboardReceptiveField was displayed during experiment.
+            to_collapse: bool
+                    Options to choose between temporally collapsed, 2D spike-triggered average (True), or 3D STA (False).
 
             Returns
             -------
             numpy.ndarray
-                        A 3D array (n ms, board resolution, board resolution) containing the 2D, average
-                        pixel values of the checkerboard, where each page is n ms before the spike.
+                        Either: 3D array (n ms, frame height, frame width) containing the 2D, spike-triggered average of
+                        the checkerboard and spike_times, where each page is n ms before the spike.
+                        OR: 2D array (frame_height, frame_width) containing the temporally collapsed spike-triggered average,
+                        where each column corresponds the average across axis=2 of one frame.
         """
         # First need to construct the huge 3D array that is the movie of the checkerboard stimulus.
         # Use numba maybe as separate, optimized function to create array. This is because the rng used by
         # python's random is a mersenne twister, but numpy is PCG i.e. different paths from the same seed.
 
         ## Extract correct stim based on 'order' parameter.
-        stim_info = self.find_stim('CheckerboardReceptiveField')
-        stim_info = stim_info if isinstance(stim_info, dict) else stim_info[order]
+        stim_info = self.find_stim('CheckerboardReceptiveField')[order]
         # Find dimensions of the 2D frame
         check_coords = np.array(stim_info['checkCoordinates'])
         frame_height, frame_width = check_coords[check_coords[:,0] == check_coords[0,0]].shape[0], check_coords[check_coords[:,1] == check_coords[0,1]].shape[0]
@@ -354,10 +360,17 @@ class Urchin:
         if self.checks[f'c_{order}'] is None:
             # Create 3D checkerboard with known (pages, rows, and column), and the random seed.
             # This contains checks for epochs outside of stim_time. To boost efficiency, it might be best to separate this step from the others.
-            checkerboard = _checkerboard((stim_info['stimulusReps'], np.ceil(stim_info['_stimTimeNumFrames'] / stim_info['frameDwell']).astype(int), len(check_coords)), stim_info['randomSeed'])
-            self.checks[f'c_{order}'] = checkerboard
+            checkerboard = _checkerboard(
+                                        stim_info['stimulusReps'],
+                                        np.ceil(stim_info['_stimTimeNumFrames'] / stim_info['frameDwell']).astype(int),
+                                        len(check_coords),
+                                        stim_info['randomSeed']).astype(int)
 
-        ## Fix dropped TTL pulses in on_times during this stim production.
+            self.checks[f'c_{order}'] = checkerboard
+        else:
+            checkerboard = self.checks[f'c_{order}']
+
+        ## Fix dropped TTL pulses in on_times during this epoch production.
         stim_times = self.on_times[start_ind+1:stop_ind] # start_ind + 1 as bounds should include pre and tail_time.
         expected_frame_interval = stim_info["frameDwell"] / stim_info["_FR"] # frameDwell is in frames, not seconds.
         frame_intervals = np.diff(stim_times)
@@ -366,13 +379,29 @@ class Urchin:
         # int division to find how many frames were dropped, based on expected_frame_interval.
         missing_frames = ((frame_intervals[poor_samples_mask]*100) // (expected_frame_interval*100))
         # Fill in the times of the missing frames based on the values in missing_frames.
-        # Indices are all referenced to stim_times, a subset of self.on_times. Slice gets the middle and omits end bounds of linspace.
-        missing_times = [np.linspace(stim_times[ind], stim_times[ind+1], missed+2)[1:-1] for ind, missed in zip(poor_samples_inds, missing_frames.astype(int))] if len(missing_frames) != 0 else None
-        # To take advantage of numpy insert, we need to flatten missing_times, then map the index to the corresponding time.
-        size_missing_times = [len(time) for time in missing_times]
-        poor_samples_inds += 1 # Add one as np.insert will place value to replace specificed index, and current inds are left hand bound of time interval.
-        # Use mapping to insert flattened missing_times into stim_times. Note that np.fromiter(chain.from_iterable(missing_times)) is faster than hstack. But this is fine for one execution.
-        stim_times = np.insert(stim_times, np.repeat(poor_samples_inds, size_missing_times), np.hstack(missing_times))
+        if len(missing_frames) != 0:
+            # Indices are all referenced to stim_times, a subset of self.on_times. Slice gets the middle and omits end bounds of linspace.
+            missing_times = [np.linspace(stim_times[ind], stim_times[ind+1], missed+2)[1:-1] for ind, missed in zip(poor_samples_inds, missing_frames.astype(int))]
+            # To take advantage of numpy insert, we need to flatten missing_times, then map the index to the corresponding time.
+            size_missing_times = [len(time) for time in missing_times]
+            poor_samples_inds += 1 # Add one as np.insert will place value to replace specificed index, and current inds are left hand bound of time interval.
+            # Use mapping to insert flattened missing_times into stim_times. Note that np.fromiter(chain.from_iterable(missing_times)) is faster than hstack. But this is fine for one execution.
+            stim_times = np.insert(stim_times, np.repeat(poor_samples_inds, size_missing_times), np.hstack(missing_times))
+
+        ## Spike-triggered average of pixel values on each frame based on spike_times in bounded_spike_times.
+        # Because stim_times is being used to map to win flips in checkerboard axis=1, they have to be
+        # of the same size. However, they are often different sizes, with the trend of more TTL pulses than
+        # win flips. So kludge is to resize stim_times by cutting out extra pulses in the beginning of the stim.
+        extra = len(stim_times) - (np.ceil(stim_info['_stimTimeNumFrames'] / stim_info['frameDwell']).astype(int))
+        stim_times_pruned = stim_times[extra:]
+        # Get 10 frames before each spike in total spikes within epoch (rep) bounds. Skip spikes close to the start of the epoch (rep).
+        sta = np.array([checkerboard[rep_num][stim_times_pruned < s_t][-10:] for s_t in bounded_spike_times if len(checkerboard[rep_num][stim_times_pruned < s_t][-10:]) == 10])
+        # Calculate mean of pixel values -10: frames behind spike, and reshape to look like frame.
+        sta = np.mean(sta, axis=0).reshape(len(sta), frame_height, frame_width)
+        # As 'sta' is a 3D array across time, we can compress to 2D to examine temporal changes in pixel intensity
+        # of receptive field. We compress by mean across columns.
+        sta_temporal = np.fromiter(chain.from_iterable(np.mean(sta, axis=2))).reshape(frame_height, frame_width)
+        return sta_temporal if to_collapse else sta
 
     def _extract_spiketimes(self, group_idx, cluster_ids):
         """ Extract spike times from given group_idx (group directory) and cluster_id.
@@ -456,21 +485,22 @@ class Urchin:
         return transformed_FR.sum(axis=0)
 
     @jit
-    def _checkerboard(dimensions, seed):
+    def _checkerboard(epochs, frames, pixels, seed):
         """ Create checkerboard array to recreate checkerboard stimulus. This is optimized with
             numba's jit.
             python: 6m 28s
             numpy: 18.15s
             numba: ~13s
         """
-        epochs, frames, pixels = dimensions
-        board = np.empty((page, row, column))
+        # Note that when using numba, nopython mode has limitations on what can be compiled, so astype(int) must be
+        # run on 'board' when _checkerboard is called.
+        board = np.empty((epochs, frames, pixels))
         random.seed(seed)
         for i in range(epochs):
             for j in range(frames):
                 for k in range(pixels):
                     board[i,j,k] = (int(random.random() < 0.5) - 0.5)*2
-        return board.astype(int)
+        return board # This needs to be converted to int at the time of function call when using numba.
 
     def _find_cluster_info(self):
         """ Used to extract information for electrical image (ei), such as

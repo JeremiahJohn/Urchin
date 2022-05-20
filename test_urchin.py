@@ -291,12 +291,13 @@ chunks = _split_pause_chunks()
 stim_bounds = peel_nesting([_find_stim_bounds(*bound, stim) for bound, stim in zip(non_pause_bounds, chunks)])
 print(stim_bounds[-1])
 sub_stim_bounds = _find_sub_stim_bounds(*stim_bounds[-1])
+print(sub_stim_bounds)
 plt.eventplot(prune_times[132:808])
 poor_board = np.diff(prune_times[132:808])
 np.where(poor_board)[0].shape
 plt.eventplot(prune_times[132:808])
-prune_times[132:808].shape
-len(generate_RF(131,808))
+prune_times[1476:2148].shape
+len(generate_RF(1475,2148))
 check_coords = np.array(_find_stim('CheckerboardReceptiveField')['checkCoordinates'])
 frame_height, frame_width = check_coords[check_coords[:,0] == check_coords[0,0]].shape[0], check_coords[check_coords[:,1] == check_coords[0,1]].shape[0]
 
