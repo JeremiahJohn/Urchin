@@ -110,9 +110,9 @@ def _separate_stims(start_bound, stop_bound, _duration, re_count=0):
     # atol is 0.01.
     time_to_find = prune_times[start_bound]+ _duration
     times_to_search = prune_times[start_bound:stop_bound+1]
-    found_time = np.isclose(times_to_search, time_to_find, rtol=0.001, atol=0.01)
+    found_time = np.isclose(times_to_search, time_to_find, rtol=0.003, atol=0.01) if re_count != 2 else np.isclose(times_to_search, time_to_find, rtol=0.0096, atol=0.01)
     ind_found_time = np.where(found_time == True)[0]
-    return (start_bound, start_bound + ind_found_time[0]) if ind_found_time.size != 0 else _separate_stims(start_bound+1, stop_bound, _duration, re_count=1) if re_count != 1 else None
+    return (start_bound, start_bound + ind_found_time[0]) if ind_found_time.size != 0 else _separate_stims(start_bound+1, stop_bound, _duration, re_count=1) if re_count !=1 else (None, None)
 
 # Use non_pause_bounds to search for complete or additive combination of stims.
 def _find_stim_bounds(start_bound, stop_bound, bound_stims):
@@ -141,9 +141,11 @@ def _find_stim_bounds(start_bound, stop_bound, bound_stims):
     return stim_ends
 
 def _find_stim(stim_name):
-    for stim in stim_list:
-        if (stim['protocolName'] == stim_name):
-            return stim
+    opt = [stim for stim in stim_list if stim['protocolName'] == stim_name]
+    return opt if len(opt) != 1 else opt[0]
+    # for stim in stim_list:
+    #     if (stim['protocolName'] == stim_name):
+    #         return stim
 
 def _find_sub_stim_bounds(name, start_bound, stop_bound, timing_info):
     # For most stimuli, the actual stimulus is repeated in each epoch; sub-stimulus bounds must be extracted.
@@ -173,12 +175,12 @@ def _find_sub_stim_bounds(name, start_bound, stop_bound, timing_info):
         for option in range( (len(stim_options) if isinstance(stim_options,list) else stim_options) ):
             # inter_stim_time
             if inter_stim_time != 0:
-                _, inter_stim_ind = _separate_stims(start_bound, stop_bound, inter_stim_time)
+                test_strt, inter_stim_ind = _separate_stims(start_bound, stop_bound, inter_stim_time)
                 start_bound += inter_stim_ind-start_bound if inter_stim_ind is not None else 0
 
             mod_start_bound, duration_bound = _separate_stims(start_bound,stop_bound, epoch_time-inter_stim_time)
             sub_epoch_ends.append([mod_start_bound, duration_bound])
-            start_bound += sub_epoch_ends[option][1]-start_bound if sub_epoch_ends[option][1] is not None else 0
+            start_bound += duration_bound-start_bound if duration_bound is not None else 0
 
         sub_rep_ends.append(sub_epoch_ends)
 
@@ -263,6 +265,23 @@ def vector_sum_DSI(cluster_rates, thetas):
     # L2 norm of resultant
     return np.linalg.norm(resultant)/total_magnitude, np.arctan(resultant[1]/resultant[0])
 
+def generate_RF(start_ind, stop_ind):
+    stim_times = prune_times[start_ind+1:stop_ind] # start_ind + 1 as bounds should include pre and tail_time.
+    expected_frame_interval = _find_stim('CheckerboardReceptiveField')
+    expected_frame_interval = expected_frame_interval["frameDwell"] / expected_frame_interval["_FR"] # frameDwell is in frames, not seconds.
+    frame_intervals = np.diff(stim_times)
+    poor_samples_mask = ~np.isclose(frame_intervals, expected_frame_interval, rtol=0.001, atol=0.01) # times when interval is not close to expected.
+    poor_samples_inds = np.where(poor_samples_mask)[0]
+    # int division to find how many frames were dropped, based on expected_frame_interval.
+    missing_frames = ((frame_intervals[poor_samples_mask]*100) // (expected_frame_interval*100))
+    # Fill in the times of the missing frames based on the values in missing_frames.
+    # Indices are all referenced to stim_times, a subset of self.on_times. Slice gets the middle and omits end bounds of linspace.
+    missing_times = [np.linspace(stim_times[ind], stim_times[ind+1], missed+2)[1:-1] for ind, missed in zip(poor_samples_inds, missing_frames.astype(int))] if len(missing_frames) != 0 else None
+    poor_samples_inds += 1 # Add one as np.insert will place value to replace specificed index i.e. insert of 3 at 1 for [0,1,2] will return [0,3,1,2]
+    # To take advantage of numpy insert, we need to flatten missing_times, then map the index to the corresponding time.
+    size_missing_times = [len(time) for time in missing_times]
+    # Use mapping to insert flattened missing_times into stim_times. Note that np.fromiter(chain.from_iterable(missing_times)) is faster. But this is fine for one execution.
+    return np.insert(stim_times, np.repeat(poor_samples_inds, size_missing_times), np.hstack(missing_times))
 
 peel_nesting = lambda a_l: [a_s for a in a_l for a_s in a]
 pause_bounds = [_find_pauses(ind,interval,stim_sum) for ind, interval in intervals if _find_pauses(ind,interval,stim_sum) != None]
@@ -270,11 +289,21 @@ non_pause_bounds = [_find_non_pause_bounds(ind, bound) for ind, bound in enumera
 non_pause_bounds = [non_pause for non_pause_bound in non_pause_bounds for non_pause in non_pause_bound]
 chunks = _split_pause_chunks()
 stim_bounds = peel_nesting([_find_stim_bounds(*bound, stim) for bound, stim in zip(non_pause_bounds, chunks)])
-print(stim_bounds[3])
-sub_stim_bounds = _find_sub_stim_bounds(*stim_bounds[4])
+print(stim_bounds[-1])
+sub_stim_bounds = _find_sub_stim_bounds(*stim_bounds[-1])
+plt.eventplot(prune_times[132:808])
+poor_board = np.diff(prune_times[132:808])
+np.where(poor_board)[0].shape
+plt.eventplot(prune_times[132:808])
+prune_times[132:808].shape
+len(generate_RF(131,808))
+check_coords = np.array(_find_stim('CheckerboardReceptiveField')['checkCoordinates'])
+frame_height, frame_width = check_coords[check_coords[:,0] == check_coords[0,0]].shape[0], check_coords[check_coords[:,1] == check_coords[0,1]].shape[0]
+
+
 print(sub_stim_bounds)
 # The spikes occurring within bound of stimuli time can now be extracted per cluster.
-print(f'epoch: {(prune_times[123]-prune_times[122])} and actual: {stim_bounds[1][3][1]}')
+print(f'epoch: {(prune_times[1474]-prune_times[1473])} and actual: {stim_bounds[1][3][1]}')
 prune_times[43:47]
 # load example spike_times for cluster 10
 normalize = lambda a_l: (a_l - min(a_l)) / (max(a_l) - min(a_l))
@@ -343,14 +372,16 @@ len(clustered_heatmap)
 # OFF_transient (0,1,4): [0][[0,1]], [1][-1:], [4][0]
 # OFF_sustained 5: [5][[1,2,3,-1]]
 # ON-OFF (3,6,7,9,10): [6][4], [9][2], [10][[6,-5]]
-# ON DS flash response characterized in group 13.
-sns.heatmap(clustered_heatmap[16][[0,8,9,-2]],
+# ON DS flash response characterized in group 13, 14.
+# ON DS-like. 'turbo' colormap 13, 14: [13][[0,1,3]] [14][[1,3,4]]
+# np.vstack([[16][[0,8,9,-2]], [13][[3]], [14][[1,3,4]], [0][[0,1]], [1][-1:], [4][0], [5][[1,2,3,-1]], [6][4], [9][2], [10][[6,-5]]])
+sns.heatmap(np.vstack([clustered_heatmap[13][[3]], clustered_heatmap[14][[1,3,4]]]),
             vmin=0,
             cmap="rocket",
-            cbar_kws={"label": "spikes/s", "shrink": 0.8, "location": "left"},
+            cbar_kws={"label": "spikes/s", "shrink": 0.8},
             rasterized=True,
             linewidth=0, xticklabels=0, yticklabels=0)
-plt.savefig("ON_transient_left.svg", format="svg")
+plt.savefig("ON_burst.svg", format="svg")
 #c1: ON sustained 16, 8, 7. ON burst, then sustained 12
 given_clust = np.where(sorted_responses == 1)
 sns.heatmap(total_heatmap[143:150], linewidths=0)
@@ -379,8 +410,8 @@ def _test_chunk(s_b, st_b, w_s, s):
         cn += s
         yield b_b if i != t_s else (cn, st_b)
 list(_test_chunk(0,3,0.05,0.01))
-
-
+rng = np.random.default_rng(1)
+l_arr = ((rng.random((3,4,4)) > 0.5).astype(int)-0.5)*2
 
 # time per epoch = pre_time + stim_time + tail_time
 # num of epochs = stimulus_reps + step_sizes
