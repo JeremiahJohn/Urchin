@@ -1,12 +1,13 @@
 import numpy as np
 import json
 import math
+import random
 import pickle
 from itertools import compress
 import matplotlib.pyplot as plt
 import scipy.io as sio
 from scipy.cluster.hierarchy import ward, average, single, centroid, fcluster
-from scipy.cluster.vq import kmeans2
+from numba import jit
 from scipy.spatial.distance import pdist
 import seaborn as sns; sns.set_theme()
 
@@ -142,7 +143,7 @@ def _find_stim_bounds(start_bound, stop_bound, bound_stims):
 
 def _find_stim(stim_name):
     opt = [stim for stim in stim_list if stim['protocolName'] == stim_name]
-    return opt if len(opt) != 1 else opt[0]
+    return opt
     # for stim in stim_list:
     #     if (stim['protocolName'] == stim_name):
     #         return stim
@@ -160,7 +161,7 @@ def _find_sub_stim_bounds(name, start_bound, stop_bound, timing_info):
 
     stim_options = ['stepSizes', 'orientations', 'gratingOrientations']
     stim_log = ['flashLog', 'orientationLog']
-    current_stim = _find_stim(name)
+    current_stim = _find_stim(name)[0]
     stim_options = current_stim[valid_option(stim_options,current_stim)[0]] if valid_option(stim_options,current_stim) else 1
     stim_log = current_stim[valid_option(stim_log,current_stim)[0]] if valid_option(stim_log,current_stim) else 1
     stim_log = list(chunk(stim_log, len(stim_options))) if stim_options !=1 else None
@@ -265,23 +266,68 @@ def vector_sum_DSI(cluster_rates, thetas):
     # L2 norm of resultant
     return np.linalg.norm(resultant)/total_magnitude, np.arctan(resultant[1]/resultant[0])
 
-def generate_RF(start_ind, stop_ind):
+def _checkerboard(epochs, frames, pixels, seed):
+    # seed = 0.6107989573688088
+    board = np.empty((epochs, frames, pixels), dtype=np.float64)
+    random.seed(seed)
+    for i in range(epochs):
+        for j in range(frames):
+            for k in range(pixels):
+                board[i,j,k] = (int(random.random() < 0.5) - 0.5)*2
+    return board
+
+def generate_RF(start_ind, stop_ind, rep_num, bounded_spike_times, order=0, to_collapse=False, axis=1):
+    p_floor = lambda a, p=0: np.floor(a * 10**p) / 10**p
+    ## Extract correct stim based on 'order' parameter.
+    stim_info = _find_stim('CheckerboardReceptiveField')[order]
+    # Find dimensions of the 2D frame
+    check_coords = np.array(stim_info['checkCoordinates'])
+    frame_height, frame_width = check_coords[check_coords[:,0] == check_coords[0,0]].shape[0], check_coords[check_coords[:,1] == check_coords[0,1]].shape[0]
+
+    ## Create checkerboard for this stim if it hasn't been made yet.
+    checkerboard = _checkerboard(
+                                stim_info['stimulusReps'],
+                                np.ceil(stim_info['_stimTimeNumFrames'] / stim_info['frameDwell']).astype(int),
+                                len(check_coords),
+                                stim_info['randomSeed']).astype(int)
+
+    ## Fix dropped TTL pulses in on_times during this epoch production.
     stim_times = prune_times[start_ind+1:stop_ind] # start_ind + 1 as bounds should include pre and tail_time.
-    expected_frame_interval = _find_stim('CheckerboardReceptiveField')
-    expected_frame_interval = expected_frame_interval["frameDwell"] / expected_frame_interval["_FR"] # frameDwell is in frames, not seconds.
+    expected_frame_interval = stim_info["frameDwell"] / stim_info["_FR"] # frameDwell is in frames, not seconds.
     frame_intervals = np.diff(stim_times)
     poor_samples_mask = ~np.isclose(frame_intervals, expected_frame_interval, rtol=0.001, atol=0.01) # times when interval is not close to expected.
     poor_samples_inds = np.where(poor_samples_mask)[0]
     # int division to find how many frames were dropped, based on expected_frame_interval.
-    missing_frames = ((frame_intervals[poor_samples_mask]*100) // (expected_frame_interval*100))
+    missing_frames = ((p_floor(frame_intervals[poor_samples_mask], p=2)*100) // (expected_frame_interval*100))
     # Fill in the times of the missing frames based on the values in missing_frames.
-    # Indices are all referenced to stim_times, a subset of self.on_times. Slice gets the middle and omits end bounds of linspace.
-    missing_times = [np.linspace(stim_times[ind], stim_times[ind+1], missed+2)[1:-1] for ind, missed in zip(poor_samples_inds, missing_frames.astype(int))] if len(missing_frames) != 0 else None
-    poor_samples_inds += 1 # Add one as np.insert will place value to replace specificed index i.e. insert of 3 at 1 for [0,1,2] will return [0,3,1,2]
-    # To take advantage of numpy insert, we need to flatten missing_times, then map the index to the corresponding time.
-    size_missing_times = [len(time) for time in missing_times]
-    # Use mapping to insert flattened missing_times into stim_times. Note that np.fromiter(chain.from_iterable(missing_times)) is faster. But this is fine for one execution.
-    return np.insert(stim_times, np.repeat(poor_samples_inds, size_missing_times), np.hstack(missing_times))
+    if len(missing_frames) != 0:
+        # Indices are all referenced to stim_times, a subset of self.on_times. Slice gets the middle and omits end bounds of linspace.
+        missing_times = [np.linspace(stim_times[ind], stim_times[ind+1], missed+2)[1:-1] for ind, missed in zip(poor_samples_inds, missing_frames.astype(int))]
+        # To take advantage of numpy insert, we need to flatten missing_times, then map the index to the corresponding time.
+        size_missing_times = [len(time) for time in missing_times]
+        poor_samples_inds += 1 # Add one as np.insert will place value to replace specificed index, and current inds are left hand bound of time interval.
+        # Use mapping to insert flattened missing_times into stim_times. Note that np.ravel is faster than hstack. But this is fine for one execution.
+        stim_times = np.insert(stim_times, np.repeat(poor_samples_inds, size_missing_times), np.hstack(missing_times))
+
+    ## Spike-triggered average of pixel values on each frame based on spike_times in bounded_spike_times.
+    # Because stim_times is being used to map to win flips in checkerboard axis=1, they have to be
+    # of the same size. However, they are often different sizes, with the trend of more TTL pulses than
+    # win flips. So kludge is to resize stim_times by cutting out extra pulses in the beginning of the stim.
+    extra = len(stim_times) - (np.ceil(stim_info['_stimTimeNumFrames'] / stim_info['frameDwell']).astype(int))
+    stim_times_pruned = stim_times[:-extra] if extra != 0 else stim_times
+    frames_before = 30
+    # Get 30 frames before each spike in total spikes within epoch (rep) bounds. Skip spikes close to the start of the epoch (rep).
+    sta = np.array([( np.vstack([checkerboard[rep_num][stim_times_pruned < s_t][-frames_before:], checkerboard[rep_num][stim_times_pruned >= s_t][:10]])
+                        if (len(checkerboard[rep_num][stim_times_pruned < s_t][-frames_before:]) == frames_before) and (len(checkerboard[rep_num][stim_times_pruned >= s_t][:10]) == 10)
+                        else np.vstack([np.zeros((frames_before, 600)), np.zeros((10, 600)) ]) )
+                    for s_t in bounded_spike_times ])
+    # Calculate mean of pixel values -30: frames behind spike, and reshape to look like frame.
+    #sns.heatmap(sta.mean(axis=0)[38].reshape(30,20).T)
+    sta = np.transpose(np.mean(sta, axis=0).reshape(frames_before+10, frame_width, frame_height), axes=(0,2,1))
+    # As 'sta' is a 3D array across time, we can compress to 2D to examine temporal changes in pixel intensity
+    # of receptive field. We compress by mean across columns.
+    sta_temporal = np.mean(sta, axis=axis).T
+    return sta_temporal if to_collapse else sta
 
 peel_nesting = lambda a_l: [a_s for a in a_l for a_s in a]
 pause_bounds = [_find_pauses(ind,interval,stim_sum) for ind, interval in intervals if _find_pauses(ind,interval,stim_sum) != None]
@@ -292,15 +338,23 @@ stim_bounds = peel_nesting([_find_stim_bounds(*bound, stim) for bound, stim in z
 print(stim_bounds[-1])
 sub_stim_bounds = _find_sub_stim_bounds(*stim_bounds[-1])
 print(sub_stim_bounds)
-plt.eventplot(prune_times[132:808])
+# NOTE missing critical TTL pulse at index 1474, bounding tail_time of rep_1
+temp_prune_times = np.insert(prune_times, 1474, prune_times[1473]+5)
+plt.eventplot(temp_prune_times[131:3532])
 poor_board = np.diff(prune_times[132:808])
-np.where(poor_board)[0].shape
-plt.eventplot(prune_times[132:808])
-prune_times[1476:2148].shape
-len(generate_RF(1475,2148))
-check_coords = np.array(_find_stim('CheckerboardReceptiveField')['checkCoordinates'])
+sample_RF = np.load("ss/analysis/data/sample_RF.npy")
+with open("ss/analysis/data/spikes_first_checks.pkl", 'rb') as f:
+    spikes_first_checks = pickle.load(f)
+spike_times_22 = np.load("ss/analysis/data/clust_22.npy")
+[ind for ind, s_t in enumerate(spikes_first_checks) if len(s_t) >= 1000]
+sample_22_RF = generate_RF(131,808,0,spikes_first_checks[3], to_collapse=True, axis=1)
+sns.heatmap(sample_22_RF, cmap='viridis')
+## Test RF computation ##
+# len(generate_RF(1475,2148))
+checks = { f'c_{c_n}':None for c_n in range(len(_find_stim('CheckerboardReceptiveField'))) }
+check_coords = np.array(_find_stim('CheckerboardReceptiveField')[0]['checkCoordinates'])
 frame_height, frame_width = check_coords[check_coords[:,0] == check_coords[0,0]].shape[0], check_coords[check_coords[:,1] == check_coords[0,1]].shape[0]
-
+plt.scatter(check_coords[:,0], check_coords[:,1])
 
 print(sub_stim_bounds)
 # The spikes occurring within bound of stimuli time can now be extracted per cluster.
@@ -335,7 +389,7 @@ with open("ss/analysis/data/spikes_first_flash.pkl", 'rb') as f:
     spiketimes_first_flash = pickle.load(f)
 sns.heatmap(flash_FR[50:59], yticklabels=False, linewidths=0)
 orientation_FR[:,60]
-orientation_rad = np.array(_find_stim('MovingBar')['orientations'])*np.pi/180
+orientation_rad = np.array(_find_stim('MovingBar')[0]['orientations'])*np.pi/180
 cartesian_transform = lambda rho, theta: (rho*math.cos(theta), rho*math.sin(theta))
 # c: 179, 4, 9, 24, 26, 32, 53, 68, 69, 70 (33, 34, 39, 50, 52)
 c_i = 170
@@ -366,7 +420,8 @@ d_link = ward(d_ma)
 # c2: threshold 0.8 with ward clustering and cosine distance.
 sorted_responses = fcluster(d_link, 0.8, criterion='distance')
 clustered_heatmap = [flash_FR[sorted_responses == g_num] for g_num in range(1, sorted_responses.max()+1)]
-len(clustered_heatmap)
+np.where(sorted_responses==12)[:10]
+len(clustered_heatmap[3])
 # c2:
 # ON_transient (16,8,9): [16][[0,8,9,-2]]
 # ON_sustained 11: [11][[2,3,8,13]]
@@ -376,7 +431,7 @@ len(clustered_heatmap)
 # ON DS flash response characterized in group 13, 14.
 # ON DS-like. 'turbo' colormap 13, 14: [13][[0,1,3]] [14][[1,3,4]]
 # np.vstack([[16][[0,8,9,-2]], [13][[3]], [14][[1,3,4]], [0][[0,1]], [1][-1:], [4][0], [5][[1,2,3,-1]], [6][4], [9][2], [10][[6,-5]]])
-sns.heatmap(np.vstack([clustered_heatmap[13][[3]], clustered_heatmap[14][[1,3,4]]]),
+sns.heatmap(pruned_total_heatmap[31:35],
             vmin=0,
             cmap="rocket",
             cbar_kws={"label": "spikes/s", "shrink": 0.8},
@@ -414,6 +469,11 @@ list(_test_chunk(0,3,0.05,0.01))
 rng = np.random.default_rng(1)
 l_arr = ((rng.random((3,4,4)) > 0.5).astype(int)-0.5)*2
 
+
+%%timeit
+_checkerboard(2,6,5,0.030470408872349197)
+random.seed(0.030470408872349197)
+[(int(random.random() < 0.5)-0.5)*2 for _ in range(24)]
 # time per epoch = pre_time + stim_time + tail_time
 # num of epochs = stimulus_reps + step_sizes
 #inter family time = len(step_sizes) * inter_family_interval
