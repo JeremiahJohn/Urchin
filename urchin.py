@@ -7,7 +7,7 @@ from itertools import compress
 import numpy as np
 from scipy.cluster.hierarchy import ward, fcluster
 from scipy.spatial.distance import pdist
-from numba import jit
+# from numba import jit
 # import matplotlib.pyplot as plt
 import h5py
 # from phylib.io.model import TemplateModel
@@ -420,6 +420,27 @@ class Urchin:
         sta_temporal = np.mean(sta, axis=axis).T
         return sta_temporal if to_collapse else sta
 
+    def compress_RF(self, full_sta, axis=1):
+        """ Compress spike-triggered average computed in generate_RF when performing batch operations.
+            Parameters
+            ----------
+            full_sta: ndarray
+                    A 3D array representing the full spike-triggered average, where each page is a frame
+                    closer to the frame immediately before a spike, and value at each page is the row x column
+                    average frame pixel intensities.
+            axis: int
+                    The axis (row or column) to compress the full_sta along.
+
+            Returns
+            -------
+            numpy.ndarray
+                    A 2D, compressed represntation of the spike-triggered average, with axis=2 representing temporal
+                    changes (closer to the spike) and axis=1 representing spatial pixel changes on one frame (position).
+        """
+        # Transpose as the result of np.mean is a vertically stacked array, with each layer being a frame.
+        return np.mean(full_sta, axis=axis).T
+
+
     def _extract_spiketimes(self, group_idx, cluster_ids):
         """ Extract spike times from given group_idx (group directory) and cluster_id.
             Parameters
@@ -505,19 +526,19 @@ class Urchin:
     def _checkerboard(epochs, frames, pixels, seed):
         """ Create checkerboard array to recreate checkerboard stimulus. This is optimized with
             numba's jit.
+            Differing rng:
             python: 6m 28s
             numpy: 18.15s
             numba: ~13s
         """
         # Note that when using numba, nopython mode has limitations on what can be compiled, so astype(int) must be
         # run on 'board' when _checkerboard is called.
-        board = np.empty((epochs, frames, pixels), dtype=np.float64)
+        # Eliminated nested for loops in favor of list comprehension with numpy's reshape
+        # 283ms vs ~630ms
+        # board = np.empty((epochs, frames, pixels), dtype=np.float64)
         random.seed(seed)
-        for i in range(epochs):
-            for j in range(frames):
-                for k in range(pixels):
-                    board[i,j,k] = (int(random.random() < 0.5) - 0.5)*2
-        return board # This needs to be converted to int at the time of function call when using numba.
+        board = np.array([random.random() for _ in range(epochs*frames*pixels)]).reshape((epochs, frames, pixels))
+        return ((board < 0.5).astype(int) - 0.5)*2
 
     def _find_cluster_info(self):
         """ Used to extract information for electrical image (ei), such as

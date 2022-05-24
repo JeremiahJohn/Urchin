@@ -266,15 +266,19 @@ def vector_sum_DSI(cluster_rates, thetas):
     # L2 norm of resultant
     return np.linalg.norm(resultant)/total_magnitude, np.arctan(resultant[1]/resultant[0])
 
+
 def _checkerboard(epochs, frames, pixels, seed):
     # seed = 0.6107989573688088
-    board = np.empty((epochs, frames, pixels), dtype=np.float64)
     random.seed(seed)
-    for i in range(epochs):
-        for j in range(frames):
-            for k in range(pixels):
-                board[i,j,k] = (int(random.random() < 0.5) - 0.5)*2
-    return board
+    # board = np.empty((epochs, frames, pixels), dtype=np.float64)
+    # for i in range(epochs):
+    #     for j in range(frames):
+    #         for k in range(pixels):
+    #             board[i,j,k] = (int(random.random() < 0.5) - 0.5)*2
+    # return board
+    board = np.array([random.random() for _ in range(epochs*frames*pixels)]).reshape((epochs, frames, pixels))
+    return ((board < 0.5).astype(int) - 0.5)*2
+
 
 def generate_RF(start_ind, stop_ind, rep_num, bounded_spike_times, order=0, to_collapse=False, axis=1):
     p_floor = lambda a, p=0: np.floor(a * 10**p) / 10**p
@@ -347,7 +351,7 @@ with open("ss/analysis/data/spikes_first_checks.pkl", 'rb') as f:
     spikes_first_checks = pickle.load(f)
 spike_times_22 = np.load("ss/analysis/data/clust_22.npy")
 [ind for ind, s_t in enumerate(spikes_first_checks) if len(s_t) >= 1000]
-sample_22_RF = generate_RF(131,808,0,spikes_first_checks[3], to_collapse=True, axis=1)
+sample_22_RF = generate_RF(131,808,0,spikes_first_checks[31], to_collapse=True, axis=1)
 sns.heatmap(sample_22_RF, cmap='viridis')
 ## Test RF computation ##
 # len(generate_RF(1475,2148))
@@ -471,7 +475,8 @@ l_arr = ((rng.random((3,4,4)) > 0.5).astype(int)-0.5)*2
 
 
 %%timeit
-_checkerboard(2,6,5,0.030470408872349197)
+_checkerboard(20,719,600,0.030470408872349197)
+
 random.seed(0.030470408872349197)
 [(int(random.random() < 0.5)-0.5)*2 for _ in range(24)]
 # time per epoch = pre_time + stim_time + tail_time
