@@ -362,6 +362,14 @@ class Urchin:
         # Find dimensions of the 2D frame
         check_coords = np.array(stim_info['checkCoordinates'])
         frame_height, frame_width = check_coords[check_coords[:,0] == check_coords[0,0]].shape[0], check_coords[check_coords[:,1] == check_coords[0,1]].shape[0]
+        # The number of frames before and after the spike to capture.
+        frames_before = 30
+        frames_after = 10
+        # Quick check if there are no spikes.
+        if len(bounded_spike_times) == 0:
+            sta = np.zeros((frames_before+frames_after, frame_height, frame_width))
+            sta_temporal = np.mean(sta, axis=axis).T
+            return sta_temporal if to_collapse else sta
 
         ## Create checkerboard for this stim if it hasn't been made yet.
         if self.checks[f'c_{order}'] is None:
@@ -406,13 +414,15 @@ class Urchin:
         # win flips. So kludge is to resize stim_times by cutting out extra pulses in the beginning of the stim.
         extra = len(stim_times) - (np.ceil(stim_info['_stimTimeNumFrames'] / stim_info['frameDwell']).astype(int))
         stim_times_pruned = stim_times[:-extra] if extra != 0 else stim_times
-        # Get 30 frames before each spike in total spikes within epoch (rep) bounds. Skip spikes close to the start of the epoch (rep).
-        frames_before = 30
-        frames_after = 10
-        sta = np.array([( np.vstack([checkerboard[rep_num][stim_times_pruned < s_t][-frames_before:], checkerboard[rep_num][stim_times_pruned >= s_t][:frames_after]])
+        assert len(stim_times) != 0
+        assert len(stim_times_pruned) != 0
+        # Get frames_before + frames_after number of frames before each spike in total spikes within epoch (rep) bounds.
+        # Skip spikes close to the start of the epoch (rep).
+        sta = np.array([ ( np.vstack([checkerboard[rep_num][stim_times_pruned < s_t][-frames_before:], checkerboard[rep_num][stim_times_pruned >= s_t][:frames_after]])
                             if (len(checkerboard[rep_num][stim_times_pruned < s_t][-frames_before:]) == frames_before) and (len(checkerboard[rep_num][stim_times_pruned >= s_t][:frames_after]) == frames_after)
                             else np.vstack([ np.zeros((frames_before, len(check_coords))), np.zeros((frames_after, len(check_coords))) ]) )
-                        for s_t in bounded_spike_times ])
+                        for s_t in bounded_spike_times])
+
         # Calculate mean of pixel values -30: frames behind spike, and reshape to look like frame.
         sta = np.transpose(np.mean(sta, axis=0).reshape(frames_before+frames_after, frame_width, frame_height), axes=(0,2,1))
         # As 'sta' is a 3D array across time, we can compress to 2D to examine temporal changes in pixel intensity

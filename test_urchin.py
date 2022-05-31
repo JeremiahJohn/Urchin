@@ -320,11 +320,12 @@ def generate_RF(start_ind, stop_ind, rep_num, bounded_spike_times, order=0, to_c
     extra = len(stim_times) - (np.ceil(stim_info['_stimTimeNumFrames'] / stim_info['frameDwell']).astype(int))
     stim_times_pruned = stim_times[:-extra] if extra != 0 else stim_times
     frames_before = 30
-    # Get 30 frames before each spike in total spikes within epoch (rep) bounds. Skip spikes close to the start of the epoch (rep).
-    sta = np.array([( np.vstack([checkerboard[rep_num][stim_times_pruned < s_t][-frames_before:], checkerboard[rep_num][stim_times_pruned >= s_t][:10]])
-                        if (len(checkerboard[rep_num][stim_times_pruned < s_t][-frames_before:]) == frames_before) and (len(checkerboard[rep_num][stim_times_pruned >= s_t][:10]) == 10)
-                        else np.vstack([np.zeros((frames_before, 600)), np.zeros((10, 600)) ]) )
+    frames_after = 10
+    sta = np.array([( np.vstack([checkerboard[rep_num][stim_times_pruned < s_t][-frames_before:], checkerboard[rep_num][stim_times_pruned >= s_t][:frames_after]])
+                        if (len(checkerboard[rep_num][stim_times_pruned < s_t][-frames_before:]) == frames_before) and (len(checkerboard[rep_num][stim_times_pruned >= s_t][:frames_after]) == frames_after)
+                        else np.vstack([ np.zeros((frames_before, len(check_coords))), np.zeros((frames_after, len(check_coords))) ]) )
                     for s_t in bounded_spike_times ])
+
     # Calculate mean of pixel values -30: frames behind spike, and reshape to look like frame.
     #sns.heatmap(sta.mean(axis=0)[38].reshape(30,20).T)
     sta = np.transpose(np.mean(sta, axis=0).reshape(frames_before+10, frame_width, frame_height), axes=(0,2,1))
@@ -347,15 +348,17 @@ temp_prune_times = np.insert(prune_times, 1474, prune_times[1473]+5)
 plt.eventplot(temp_prune_times[131:3532])
 poor_board = np.diff(prune_times[132:808])
 sample_RF = np.load("ss/analysis/data/sample_RF.npy")
+squish_RF = np.load("ss/analysis/data/squish_RF.npy")
 with open("ss/analysis/data/spikes_first_checks.pkl", 'rb') as f:
     spikes_first_checks = pickle.load(f)
 spike_times_22 = np.load("ss/analysis/data/clust_22.npy")
 [ind for ind, s_t in enumerate(spikes_first_checks) if len(s_t) >= 1000]
-sample_22_RF = generate_RF(131,808,0,spikes_first_checks[31], to_collapse=True, axis=1)
-sns.heatmap(sample_22_RF, cmap='viridis')
+sample_22_RF = generate_RF(131,808,0,spikes_first_checks[80], to_collapse=True, axis=1)
+sns.heatmap(squish_RF[37], cmap='viridis')
 ## Test RF computation ##
 # len(generate_RF(1475,2148))
 checks = { f'c_{c_n}':None for c_n in range(len(_find_stim('CheckerboardReceptiveField'))) }
+checks[f'c_{0}'] is None
 check_coords = np.array(_find_stim('CheckerboardReceptiveField')[0]['checkCoordinates'])
 frame_height, frame_width = check_coords[check_coords[:,0] == check_coords[0,0]].shape[0], check_coords[check_coords[:,1] == check_coords[0,1]].shape[0]
 plt.scatter(check_coords[:,0], check_coords[:,1])
@@ -424,7 +427,7 @@ d_link = ward(d_ma)
 # c2: threshold 0.8 with ward clustering and cosine distance.
 sorted_responses = fcluster(d_link, 0.8, criterion='distance')
 clustered_heatmap = [flash_FR[sorted_responses == g_num] for g_num in range(1, sorted_responses.max()+1)]
-np.where(sorted_responses==12)[:10]
+np.where(sorted_responses==14)[:10]
 len(clustered_heatmap[3])
 # c2:
 # ON_transient (16,8,9): [16][[0,8,9,-2]]
@@ -435,7 +438,7 @@ len(clustered_heatmap[3])
 # ON DS flash response characterized in group 13, 14.
 # ON DS-like. 'turbo' colormap 13, 14: [13][[0,1,3]] [14][[1,3,4]]
 # np.vstack([[16][[0,8,9,-2]], [13][[3]], [14][[1,3,4]], [0][[0,1]], [1][-1:], [4][0], [5][[1,2,3,-1]], [6][4], [9][2], [10][[6,-5]]])
-sns.heatmap(pruned_total_heatmap[31:35],
+sns.heatmap(pruned_total_heatmap[109:111],
             vmin=0,
             cmap="rocket",
             cbar_kws={"label": "spikes/s", "shrink": 0.8},
