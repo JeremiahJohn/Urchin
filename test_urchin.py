@@ -354,7 +354,7 @@ with open("ss/analysis/data/spikes_first_checks.pkl", 'rb') as f:
 spike_times_22 = np.load("ss/analysis/data/clust_22.npy")
 [ind for ind, s_t in enumerate(spikes_first_checks) if len(s_t) >= 1000]
 sample_22_RF = generate_RF(131,808,0,spikes_first_checks[80], to_collapse=True, axis=1)
-sns.heatmap(squish_RF[37], cmap='viridis')
+sns.heatmap(squish_RF[34], cmap='viridis')
 ## Test RF computation ##
 # len(generate_RF(1475,2148))
 checks = { f'c_{c_n}':None for c_n in range(len(_find_stim('CheckerboardReceptiveField'))) }

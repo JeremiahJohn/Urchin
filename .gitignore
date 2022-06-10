@@ -4,4 +4,3 @@ Urchin/
 __pycache__/
 *.py[cod]
 *$py.class
-test_runtime.py
